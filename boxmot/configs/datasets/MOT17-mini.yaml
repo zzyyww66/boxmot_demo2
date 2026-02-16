@@ -1,0 +1,11 @@
+# MOT17-mini dataset for quick testing
+download:
+  runs_url: null  # No precomputed runs
+  dataset_url: null  # Local dataset only
+
+benchmark:
+  source: "assets/MOT17-mini"
+  split: "train"
+  eval_classes:
+    1: pedestrian
+  distractor_classes: []
