@@ -125,7 +125,7 @@ class STrack(BaseTrack):
             max_predict_frames: Maximum frames to predict before freezing
 
         Returns:
-            np.ndarray: [top, left, width, height] in tlwh format
+            np.ndarray: [left, top, width, height] in tlwh format
         """
         # If frozen_mean exists and we've exceeded max prediction frames, use frozen position
         if (self.frozen_mean is not None and
@@ -155,7 +155,7 @@ class ByteTrack(BaseTracker):
     - nr_classes (int): Total number of object classes that the tracker will handle (for per_class=True).
     - asso_func (str): Algorithm name used for data association between detections and tracks.
     - is_obb (bool): Work with Oriented Bounding Boxes (OBB) instead of standard axis-aligned bounding boxes.
-    
+
     ByteTrack-specific parameters:
     - min_conf (float): Threshold for detection confidence. Detections below this threshold are discarded.
     - track_thresh (float): Threshold for detection confidence. Detections above this threshold are considered for tracking in the first association round.
@@ -163,7 +163,22 @@ class ByteTrack(BaseTracker):
     - track_buffer (int): Number of frames to keep a track alive after it was last detected.
     - frame_rate (int): Frame rate of the video being processed. Used to scale the track buffer size.
     - entry_margin (int): Pixel width of entry zone at frame edges. New IDs are only created within this margin (birth control). Set to 0 to disable (default: 0).
+    - strict_entry_gate (bool): If True, unmatched center-zone detections do NOT create new IDs when entry gating is enabled (default: True).
     - zombie_iou_thresh (float): IoU threshold for rescuing lost tracks (zombie rescue). Higher values require better spatial overlap to reactivate a lost track (default: 0.3).
+
+    Exit zone parameters:
+    - exit_zone_enabled (bool): Enable exit zone feature. When a track disappears in the exit zone (frame edges), it enters exit-pending and can be removed after grace frames (default: False).
+    - exit_zone_margin (int): Pixel width of exit zone at frame edges. Defaults to entry_margin if not specified (default: entry_margin).
+    - exit_zone_remove_grace (int): Grace frames before removing an exit-pending lost track (default: 30).
+
+    Adaptive effective zone parameters:
+    - adaptive_zone_enabled (bool): Enable adaptive effective zone computation based on detection distribution (default: True).
+    - adaptive_zone_warmup (int): Number of frames to collect detections for computing the effective zone (default: 10).
+    - adaptive_zone_margin (int): Margin width within the effective zone to consider as entry zone (default: 50).
+    - adaptive_zone_padding (float): Padding factor applied to the effective zone bounding box (default: 1.2).
+    - adaptive_zone_update_mode (str): Effective-zone update strategy, "warmup_once" or "always_expand" (default: "always_expand").
+    - adaptive_zone_expand_trigger (str): Expansion trigger in always_expand mode, "all_high", "outside_high", or "unmatched_high" (default: "all_high").
+    - adaptive_zone_min_box_area (float): Ignore tiny boxes below this area when updating effective zone (default: 0).
 
     Attributes:
     - frame_count (int): Counter for the frames processed.
@@ -173,6 +188,7 @@ class ByteTrack(BaseTracker):
     - buffer_size (int): Size of the track buffer based on frame rate.
     - max_time_lost (int): Maximum time a track can be lost.
     - kalman_filter (KalmanFilterXYAH): Kalman filter for motion prediction.
+    - _effective_zone (np.ndarray): [x1, y1, x2, y2] effective zone computed during warmup.
     """
 
     def __init__(
@@ -206,6 +222,7 @@ class ByteTrack(BaseTracker):
 
         # Lifecycle gating configuration (scene-mask based birth control and zombie rescue)
         self.entry_margin = kwargs.get('entry_margin', 0)  # Entry zone pixel width (0 = disabled)
+        self.strict_entry_gate = kwargs.get('strict_entry_gate', True)  # Center unmatched detections cannot spawn IDs when gating is on
         self.zombie_iou_thresh = kwargs.get('zombie_iou_thresh', 0.3)  # IoU threshold for zombie rescue
 
         # Zombie track management parameters
@@ -213,21 +230,57 @@ class ByteTrack(BaseTracker):
         self.zombie_dist_thresh = kwargs.get('zombie_dist_thresh', 150)  # Distance threshold for zombie rescue (pixels)
         self.zombie_max_predict_frames = kwargs.get('zombie_max_predict_frames', 5)  # Max frames to predict zombie position
 
+        # Zombie track separation parameters
+        self.zombie_transition_frames = kwargs.get('zombie_transition_frames', self.buffer_size)  # 转为僵尸的帧数阈值
+        self.zombie_match_max_dist = kwargs.get('zombie_match_max_dist', 200)  # 僵尸匹配距离上限（像素）
+        self.lost_max_history = kwargs.get('lost_max_history', 0)  # 0 means unlimited
+
+        # Exit zone configuration
+        self.exit_zone_enabled = kwargs.get('exit_zone_enabled', False)
+        self.exit_zone_margin = kwargs.get('exit_zone_margin', self.entry_margin)  # Default to entry_margin
+        self.exit_zone_remove_grace = kwargs.get('exit_zone_remove_grace', 30)
+
+        # Adaptive effective zone configuration
+        self.adaptive_zone_enabled = kwargs.get('adaptive_zone_enabled', True)  # Whether to enable adaptive zone
+        self.adaptive_zone_warmup = kwargs.get('adaptive_zone_warmup', 10)  # Number of frames to collect detections
+        self.adaptive_zone_margin = kwargs.get('adaptive_zone_margin', 50)  # Margin within effective zone for entry
+        self.adaptive_zone_padding = kwargs.get('adaptive_zone_padding', 1.2)  # Padding factor for effective zone
+        self.adaptive_zone_update_mode = kwargs.get('adaptive_zone_update_mode', 'always_expand')
+        self.adaptive_zone_expand_trigger = kwargs.get('adaptive_zone_expand_trigger', 'all_high')
+        self.adaptive_zone_min_box_area = kwargs.get('adaptive_zone_min_box_area', 0)
+
+        # Runtime state for adaptive zone
+        self._warmup_detections = []  # Cache of detection boxes during warmup
+        self._effective_zone = None  # Effective zone [x1, y1, x2, y2] in xyxy format
+        self._outside_zone_det_inds = set()  # Detection indices that were outside effective zone before expansion
+        self._effective_zone_last_frame = -1
+
         self.active_tracks = []  # type: list[STrack]
         self.lost_stracks = []  # type: list[STrack]
+        self.zombie_stracks = []  # type: list[STrack]
         self.removed_stracks = []  # type: list[STrack]
+
+    def _zombie_enabled(self) -> bool:
+        """Return whether zombie rescue/history should be active."""
+        return (
+            self.zombie_max_history > 0
+            and self.zombie_transition_frames > 0
+            and self.zombie_match_max_dist > 0
+        )
 
     def _is_in_entry_zone(self, tlwh, img_shape, margin=None):
         """
-        Check if a bounding box is in the entry zone (edge of the frame).
+        Check if a bounding box is in the entry zone.
+
+        Supports both fixed margin mode (original behavior) and adaptive effective zone mode.
 
         Args:
-            tlwh: [top, left, width, height]
+            tlwh: [left, top, width, height]
             img_shape: (height, width)
             margin: Edge zone pixel width, defaults to self.entry_margin
 
         Returns:
-            bool: True if the box touches the edge zone
+            bool: True if the box is in the entry zone
         """
         if margin is None:
             margin = self.entry_margin
@@ -237,33 +290,233 @@ class ByteTrack(BaseTracker):
             return True
 
         img_h, img_w = img_shape[0], img_shape[1]
-        # tlwh format: [top(y), left(x), width, height]
-        y1, x1, w, h = tlwh
+        # tlwh format in this codebase: [left(x), top(y), width, height]
+        x1, y1, w, h = tlwh
         x2, y2 = x1 + w, y1 + h
 
-        # Consider entry if any side touches the edge zone
-        if x1 < margin or y1 < margin:
+        # Fixed margin mode (original behavior)
+        if not self.adaptive_zone_enabled or self._effective_zone is None:
+            # Consider entry if any side touches the edge zone
+            if x1 < margin or y1 < margin:
+                return True
+            if x2 > (img_w - margin) or y2 > (img_h - margin):
+                return True
+            return False
+
+        # Adaptive effective zone mode
+        ex1, ey1, ex2, ey2 = self._effective_zone
+
+        # If box is outside effective zone, it's in entry zone
+        if x2 < ex1 or x1 > ex2 or y2 < ey1 or y1 > ey2:
             return True
-        if x2 > (img_w - margin) or y2 > (img_h - margin):
+
+        # If box is inside effective zone, check margin within effective zone
+        margin = self.adaptive_zone_margin
+        if x1 < ex1 + margin or y1 < ey1 + margin:
+            return True
+        if x2 > ex2 - margin or y2 > ey2 - margin:
             return True
 
         return False
+
+    def _is_in_exit_zone(self, tlwh, img_shape):
+        """Check whether a box is in the image-border exit zone.
+
+        Exit-zone semantics intentionally do not depend on adaptive effective zone.
+        A non-positive margin disables exit-zone triggering.
+        """
+        margin = self.exit_zone_margin
+        if margin <= 0:
+            return False
+
+        img_h, img_w = img_shape[0], img_shape[1]
+        x1, y1, w, h = tlwh
+        x2, y2 = x1 + w, y1 + h
+        return bool(
+            x1 < margin
+            or y1 < margin
+            or x2 > (img_w - margin)
+            or y2 > (img_h - margin)
+        )
+
+    @staticmethod
+    def _set_exit_pending(track, enabled: bool):
+        track.exit_pending = bool(enabled)
+
+    def _compute_effective_zone(self):
+        """Compute effective zone from warmup detections.
+
+        Returns:
+            np.ndarray: [x1, y1, x2, y2] effective zone in xyxy coordinate system,
+                       or None if no warmup detections available.
+        """
+        if len(self._warmup_detections) == 0:
+            return None
+
+        # Convert tlwh[x, y, w, h] to xyxy
+        boxes = np.array(self._warmup_detections)
+        # boxes[:, 0] = left (x), boxes[:, 1] = top (y), boxes[:, 2] = w, boxes[:, 3] = h
+        x1 = boxes[:, 0]  # left
+        y1 = boxes[:, 1]  # top
+        x2 = boxes[:, 0] + boxes[:, 2]  # left + width
+        y2 = boxes[:, 1] + boxes[:, 3]  # top + height
+
+        # Compute bounding box
+        min_x, max_x = x1.min(), x2.max()
+        min_y, max_y = y1.min(), y2.max()
+
+        # Apply padding from center
+        cx, cy = (min_x + max_x) / 2, (min_y + max_y) / 2
+        w = (max_x - min_x) * self.adaptive_zone_padding
+        h = (max_y - min_y) * self.adaptive_zone_padding
+
+        min_x = max(0, cx - w / 2)
+        max_x = min(self.img_w if hasattr(self, 'img_w') else max_x, cx + w / 2)
+        min_y = max(0, cy - h / 2)
+        max_y = min(self.img_h if hasattr(self, 'img_h') else max_y, cy + h / 2)
+
+        return np.array([min_x, min_y, max_x, max_y])
+
+    def _tlwh_to_xyxy(self, tlwh):
+        """Convert tlwh[x, y, w, h] to xyxy[x1, y1, x2, y2]."""
+        x1, y1, w, h = tlwh
+        return np.array([x1, y1, x1 + w, y1 + h], dtype=np.float32)
+
+    def _is_outside_effective_zone(self, tlwh):
+        """Check whether tlwh box extends outside current effective zone."""
+        if self._effective_zone is None:
+            return True
+        x1, y1, w, h = tlwh
+        x2, y2 = x1 + w, y1 + h
+        ex1, ey1, ex2, ey2 = self._effective_zone
+        return x1 < ex1 or y1 < ey1 or x2 > ex2 or y2 > ey2
+
+    def _get_bbox_from_detections(self, detections):
+        """Get xyxy bbox that encloses all given detections."""
+        if not detections:
+            return None
+        boxes = np.array([self._tlwh_to_xyxy(det.tlwh) for det in detections], dtype=np.float32)
+        return np.array([boxes[:, 0].min(), boxes[:, 1].min(), boxes[:, 2].max(), boxes[:, 3].max()], dtype=np.float32)
+
+    def _clip_zone_to_image(self, zone_xyxy):
+        """Clip effective zone to image bounds."""
+        if zone_xyxy is None:
+            return None
+        if not hasattr(self, 'img_w') or not hasattr(self, 'img_h'):
+            return zone_xyxy
+        zone_xyxy[0] = max(0, zone_xyxy[0])
+        zone_xyxy[1] = max(0, zone_xyxy[1])
+        zone_xyxy[2] = min(self.img_w, zone_xyxy[2])
+        zone_xyxy[3] = min(self.img_h, zone_xyxy[3])
+        return zone_xyxy
+
+    def _apply_padding_to_zone(self, zone_xyxy):
+        """Apply adaptive padding around zone center (used for initial zone only)."""
+        if zone_xyxy is None:
+            return None
+        x1, y1, x2, y2 = zone_xyxy
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        w = (x2 - x1) * self.adaptive_zone_padding
+        h = (y2 - y1) * self.adaptive_zone_padding
+        padded = np.array([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dtype=np.float32)
+        return self._clip_zone_to_image(padded)
+
+    def _mark_outside_zone_det_inds(self, detections):
+        """Mark detection indices that were outside effective zone before current expansion."""
+        for det in detections:
+            if det.tlwh[2] * det.tlwh[3] < self.adaptive_zone_min_box_area:
+                continue
+            if self._is_outside_effective_zone(det.tlwh):
+                self._outside_zone_det_inds.add(int(det.det_ind))
+
+    def _select_expand_candidates(self, detections, phase):
+        """Select detection candidates for effective-zone expansion in always_expand mode."""
+        if not detections:
+            return []
+
+        trigger = self.adaptive_zone_expand_trigger
+        if trigger not in ('all_high', 'outside_high', 'unmatched_high'):
+            trigger = 'all_high'
+
+        candidates = []
+        for det in detections:
+            if det.tlwh[2] * det.tlwh[3] < self.adaptive_zone_min_box_area:
+                continue
+            outside = self._is_outside_effective_zone(det.tlwh)
+            if trigger == 'all_high':
+                candidates.append(det)
+            elif trigger == 'outside_high' and outside:
+                candidates.append(det)
+            elif trigger == 'unmatched_high':
+                # unmatched_high expansion is only meaningful in step4 where detections are unmatched
+                if phase == 'step4' or self._effective_zone is None:
+                    candidates.append(det)
+        return candidates
+
+    def _update_effective_zone(self, detections, phase='pre'):
+        """Update effective zone.
+
+        Args:
+            detections: List of STrack objects from current frame
+            phase: "pre" (before association) or "step4" (unmatched-high stage)
+        """
+        if not self.adaptive_zone_enabled:
+            return
+
+        if len(detections) == 0:
+            return
+
+        mode = self.adaptive_zone_update_mode
+        if mode not in ('warmup_once', 'always_expand'):
+            mode = 'always_expand'
+
+        if mode == 'warmup_once':
+            if self.frame_count > self.adaptive_zone_warmup:
+                return
+            for det in detections:
+                self._warmup_detections.append(det.tlwh.copy())
+            if self.frame_count == self.adaptive_zone_warmup and len(self._warmup_detections) > 0:
+                self._effective_zone = self._compute_effective_zone()
+                self._effective_zone_last_frame = self.frame_count
+            return
+
+        # always_expand mode: mark outside detections using previous-frame zone
+        self._mark_outside_zone_det_inds(detections)
+        candidates = self._select_expand_candidates(detections, phase=phase)
+        if not candidates:
+            return
+
+        candidate_bbox = self._get_bbox_from_detections(candidates)
+        if candidate_bbox is None:
+            return
+
+        if self._effective_zone is None:
+            # First valid frame: initialize effective zone from detections with optional padding.
+            self._effective_zone = self._apply_padding_to_zone(candidate_bbox.astype(np.float32))
+        else:
+            # Monotonic expansion only: expand to include out-of-zone detections, never shrink.
+            ex1, ey1, ex2, ey2 = self._effective_zone
+            cx1, cy1, cx2, cy2 = candidate_bbox
+            expanded = np.array([min(ex1, cx1), min(ey1, cy1), max(ex2, cx2), max(ey2, cy2)], dtype=np.float32)
+            self._effective_zone = self._clip_zone_to_image(expanded)
+        self._effective_zone_last_frame = self.frame_count
 
     def _calculate_iou(self, box1, box2):
         """
         Calculate IoU between two bounding boxes.
 
         Args:
-            box1: [x, y, w, h] (tlwh format)
-            box2: [x, y, w, h] (tlwh format)
+            box1: [left, top, width, height] (tlwh format)
+            box2: [left, top, width, height] (tlwh format)
 
         Returns:
             float: IoU value [0, 1]
         """
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[0] + box1[2], box2[0] + box2[2])
-        y2 = min(box1[1] + box1[3], box2[1] + box2[3])
+        # tlwh format: [left(x), top(y), width, height]
+        x1 = max(box1[0], box2[0])  # max(left)
+        y1 = max(box1[1], box2[1])  # max(top)
+        x2 = min(box1[0] + box1[2], box2[0] + box2[2])  # min(right = left+width)
+        y2 = min(box1[1] + box1[3], box2[1] + box2[3])  # min(bottom = top+height)
 
         inter_area = max(0, x2 - x1) * max(0, y2 - y1)
         box1_area = box1[2] * box1[3]
@@ -276,77 +529,60 @@ class ByteTrack(BaseTracker):
         """Calculate Euclidean distance between box centers.
 
         Args:
-            box1_tlwh: [top, left, width, height]
-            box2_tlwh: [top, left, width, height]
+            box1_tlwh: [left, top, width, height]
+            box2_tlwh: [left, top, width, height]
 
         Returns:
             float: Euclidean distance between centers
         """
-        # Calculate centers
-        c1_x = box1_tlwh[0] + box1_tlwh[2] / 2
-        c1_y = box1_tlwh[1] + box1_tlwh[3] / 2
-        c2_x = box2_tlwh[0] + box2_tlwh[2] / 2
-        c2_y = box2_tlwh[1] + box2_tlwh[3] / 2
+        # tlwh format: [left(x), top(y), width, height]
+        c1_x = box1_tlwh[0] + box1_tlwh[2] / 2  # left + width/2
+        c1_y = box1_tlwh[1] + box1_tlwh[3] / 2  # top + height/2
+        c2_x = box2_tlwh[0] + box2_tlwh[2] / 2  # left + width/2
+        c2_y = box2_tlwh[1] + box2_tlwh[3] / 2  # top + height/2
 
         return np.sqrt((c1_x - c2_x) ** 2 + (c1_y - c2_y) ** 2)
 
-    def _try_rescue_zombie(self, detection, lost_stracks, iou_thresh=None, dist_thresh=None):
-        """
-        Try to rescue a lost track (zombie) using hybrid matching strategy.
 
-        Stage 1: IoU matching with threshold
-        Stage 2: For unmatched, use center Euclidean distance to find nearest zombie
+    def _try_match_zombie(self, detection, zombie_stracks, max_dist=None):
+        """Try to match detection with zombie tracks using nearest distance.
 
         Args:
             detection: STrack object, unmatched detection
-            lost_stracks: list[STrack], lost tracks to search
-            iou_thresh: IoU threshold, defaults to self.zombie_iou_thresh
-            dist_thresh: Distance threshold, defaults to self.zombie_dist_thresh
+            zombie_stracks: list[STrack], zombie tracks to search (lost > 30 frames)
+            max_dist: Maximum distance threshold, defaults to self.zombie_match_max_dist
 
         Returns:
-            STrack or None: Resurrected track if found, None otherwise
+            STrack or None: Matched zombie track if found within max_dist, None otherwise
         """
-        if iou_thresh is None:
-            iou_thresh = self.zombie_iou_thresh
-        if dist_thresh is None:
-            dist_thresh = self.zombie_dist_thresh
-
-        if len(lost_stracks) == 0:
+        if max_dist is None:
+            max_dist = self.zombie_match_max_dist
+        if self.zombie_dist_thresh > 0:
+            max_dist = min(max_dist, self.zombie_dist_thresh)
+        if not self._zombie_enabled():
             return None
 
-        # Stage 1: IoU matching
-        best_iou = 0.0
-        best_iou_track = None
+        if len(zombie_stracks) == 0:
+            return None
 
-        for track in lost_stracks:
-            # Use get_tlwh_for_matching to respect frozen positions for old zombies
-            track_tlwh = track.get_tlwh_for_matching(self.frame_count, self.zombie_max_predict_frames)
-            iou = self._calculate_iou(detection.tlwh, track_tlwh)
-            if iou > best_iou:
-                best_iou = iou
-                best_iou_track = track
-
-        if best_iou > iou_thresh:
-            # Reactivate the lost track
-            best_iou_track.re_activate(detection, self.frame_count, new_id=False)
-            return best_iou_track
-
-        # Stage 2: Distance matching - find nearest zombie within threshold
         best_dist = float('inf')
-        best_dist_track = None
+        best_zombie = None
 
-        for track in lost_stracks:
-            # Use get_tlwh_for_matching to respect frozen positions
-            track_tlwh = track.get_tlwh_for_matching(self.frame_count, self.zombie_max_predict_frames)
-            dist = self._calculate_center_distance(detection.tlwh, track_tlwh)
+        for zombie in zombie_stracks:
+            zombie_tlwh = zombie.get_tlwh_for_matching(
+                frame_id=self.frame_count,
+                max_predict_frames=self.zombie_max_predict_frames
+            )
+
+            dist = self._calculate_center_distance(detection.tlwh, zombie_tlwh)
             if dist < best_dist:
                 best_dist = dist
-                best_dist_track = track
+                best_zombie = zombie
 
-        if best_dist < dist_thresh:
-            # Reactivate the nearest lost track
-            best_dist_track.re_activate(detection, self.frame_count, new_id=False)
-            return best_dist_track
+        if best_dist < max_dist:
+            # Reactivate the nearest zombie
+            best_zombie.re_activate(detection, self.frame_count, new_id=False)
+            return best_zombie
 
         return None
 
@@ -360,6 +596,14 @@ class ByteTrack(BaseTracker):
 
         dets = np.hstack([dets, np.arange(len(dets)).reshape(-1, 1)])
         self.frame_count += 1
+        self._outside_zone_det_inds = set()
+
+        # Store image dimensions for adaptive zone computation
+        if img is not None:
+            self.img_h, self.img_w = img.shape[:2]
+        elif hasattr(self, 'h') and hasattr(self, 'w'):
+            self.img_h, self.img_w = self.h, self.w
+
         activated_starcks = []
         refind_stracks = []
         lost_stracks = []
@@ -381,6 +625,10 @@ class ByteTrack(BaseTracker):
         else:
             detections = []
 
+        # Update effective zone before association.
+        if self.adaptive_zone_enabled:
+            self._update_effective_zone(detections, phase='pre')
+
         """ Add newly detected tracklets to tracked_stracks"""
         unconfirmed = []
         tracked_stracks = []  # type: list[STrack]
@@ -391,6 +639,8 @@ class ByteTrack(BaseTracker):
                 tracked_stracks.append(track)
 
         """ Step 2: First association, with high conf detection boxes"""
+        # IMPORTANT: Include lost tracks for matching (same as original ByteTrack)
+        # This allows quick recovery from short-term occlusion (<30 frames)
         strack_pool = joint_stracks(tracked_stracks, self.lost_stracks)
         # Predict the current location with KF
         STrack.multi_predict(strack_pool)
@@ -406,9 +656,11 @@ class ByteTrack(BaseTracker):
             det = detections[idet]
             if track.state == TrackState.Tracked:
                 track.update(detections[idet], self.frame_count)
+                self._set_exit_pending(track, False)
                 activated_starcks.append(track)
             else:
                 track.re_activate(det, self.frame_count, new_id=False)
+                self._set_exit_pending(track, False)
                 refind_stracks.append(track)
 
         """ Step 3: Second association, with low conf detection boxes"""
@@ -432,14 +684,35 @@ class ByteTrack(BaseTracker):
             det = detections_second[idet]
             if track.state == TrackState.Tracked:
                 track.update(det, self.frame_count)
+                self._set_exit_pending(track, False)
                 activated_starcks.append(track)
             else:
                 track.re_activate(det, self.frame_count, new_id=False)
+                self._set_exit_pending(track, False)
                 refind_stracks.append(track)
 
         for it in u_track:
             track = r_tracked_stracks[it]
             if not track.state == TrackState.Lost:
+                # Check exit zone: mark exit-pending for delayed removal after grace frames
+                if self.exit_zone_enabled:
+                    track_tlwh = track.tlwh
+                    if img is not None:
+                        current_img_shape = img.shape[:2]
+                    elif hasattr(self, 'h') and hasattr(self, 'w'):
+                        current_img_shape = (self.h, self.w)
+                    else:
+                        current_img_shape = (1080, 1920)
+
+                    in_exit_zone = self._is_in_exit_zone(track_tlwh, current_img_shape)
+                    if in_exit_zone:
+                        self._set_exit_pending(track, True)
+                    else:
+                        self._set_exit_pending(track, False)
+                else:
+                    self._set_exit_pending(track, False)
+
+                # Normal flow: mark as lost
                 track.mark_lost()
                 track.lost_frame_id = self.frame_count  # Record when track became lost
                 lost_stracks.append(track)
@@ -452,27 +725,30 @@ class ByteTrack(BaseTracker):
         matches, u_unconfirmed, u_detection = linear_assignment(dists, thresh=0.7)
         for itracked, idet in matches:
             unconfirmed[itracked].update(detections[idet], self.frame_count)
+            self._set_exit_pending(unconfirmed[itracked], False)
             activated_starcks.append(unconfirmed[itracked])
         for it in u_unconfirmed:
             track = unconfirmed[it]
             track.mark_removed()
             removed_stracks.append(track)
 
-        """ Step 4: Init new stracks with lifecycle gating (strict birth control & zombie rescue) """
+        """ Step 4: Third association - Zombie track rescue (after normal association) """
+        # This is the NEW stage: match remaining detections with zombie tracks
+        # Zombie tracks = tracks that have been lost for > 30 frames
+        # These tracks would normally be discarded by original ByteTrack
         # Get image dimensions
         if img is not None:
             current_img_shape = img.shape[:2]
         elif hasattr(self, 'h') and hasattr(self, 'w'):
             current_img_shape = (self.h, self.w)
         else:
-            # Fallback: assume 1080p (should not happen due to setup_decorator)
             current_img_shape = (1080, 1920)
 
-        # Track which zombies were rescued so we can remove them from lost_stracks
+        # Track which zombies were rescued
         rescued_zombies = []
 
         if self.frame_count == 1:
-            # First frame: give all detections new IDs, skip entry zone check
+            # First frame: give all detections new IDs
             for inew in u_detection:
                 det_track = detections[inew]
                 if det_track.conf < self.det_thresh:
@@ -480,52 +756,130 @@ class ByteTrack(BaseTracker):
                 det_track.activate(self.kalman_filter, self.frame_count)
                 activated_starcks.append(det_track)
         else:
-            # Normal frames: apply entry zone gating and zombie rescue
+            # Normal frames: process unmatched detections
             for inew in u_detection:
                 det_track = detections[inew]
                 if det_track.conf < self.det_thresh:
+                    continue
+
+                # In always_expand mode, unmatched-high trigger can expand zone in step4.
+                if (
+                    self.adaptive_zone_enabled
+                    and self.adaptive_zone_update_mode == 'always_expand'
+                    and self.adaptive_zone_expand_trigger in ('unmatched_high', 'outside_high')
+                ):
+                    self._update_effective_zone([det_track], phase='step4')
+
+                # If this detection was outside effective zone before expansion this frame,
+                # allow immediate ID creation (newly entered or newly visible region).
+                if (
+                    self.adaptive_zone_enabled
+                    and self.adaptive_zone_update_mode == 'always_expand'
+                    and int(det_track.det_ind) in self._outside_zone_det_inds
+                ):
+                    det_track.activate(self.kalman_filter, self.frame_count)
+                    activated_starcks.append(det_track)
                     continue
 
                 det_tlwh = det_track.tlwh
                 is_entry = self._is_in_entry_zone(det_tlwh, current_img_shape)
 
                 if is_entry:
-                    # Case A: In entry zone -> allow new ID creation
+                    # In entry zone -> create new ID (original behavior)
                     det_track.activate(self.kalman_filter, self.frame_count)
+                    self._set_exit_pending(det_track, False)
                     activated_starcks.append(det_track)
                 else:
-                    # Case B: In center of frame -> try zombie rescue
-                    zombie = self._try_rescue_zombie(det_track, self.lost_stracks)
+                    # In center zone -> try match with zombie tracks
+                    # Zombie tracks are those lost for > 30 frames
+                    zombie = self._try_match_zombie(det_track, self.zombie_stracks)
                     if zombie:
-                        # Rescued! Add to refind_stracks (not activated_starcks)
-                        # because it's a reactivation, not a new activation
+                        # Rescued a zombie track!
                         refind_stracks.append(zombie)
                         rescued_zombies.append(zombie)
-                    # If rescue fails, do NOT create new ID (prevents IDSW from false detections)
+                    else:
+                        # Strict entry gate: center-zone detections do not spawn new IDs.
+                        # This is the core "严进" policy for fixed-camera deployments.
+                        if self.strict_entry_gate and self.entry_margin > 0:
+                            continue
+                        det_track.activate(self.kalman_filter, self.frame_count)
+                        self._set_exit_pending(det_track, False)
+                        activated_starcks.append(det_track)
 
-        """ Step 5: Update state (remove rescued zombies from lost_stracks) """
-        # Remove rescued tracks from lost_stracks to prevent duplicate tracking
+        """ Step 5: Update lost tracks and transition to zombie """
+        # Add newly lost tracks to self.lost_stracks
+        for track in lost_stracks:
+            self.lost_stracks.append(track)
+
+        zombie_enabled = self._zombie_enabled()
+
+        # Freeze positions for tracks that have been lost too long (zombie mode only)
+        if zombie_enabled and self.zombie_max_predict_frames > 0:
+            for track in self.lost_stracks:
+                if track.frozen_mean is None:
+                    frames_lost = self.frame_count - track.lost_frame_id
+                    if frames_lost >= self.zombie_max_predict_frames:
+                        track.frozen_mean = track.mean.copy()
+
+        """ Step 6: Transition old lost tracks to zombie tracks """
+        # In zombie mode: move stale lost tracks into zombie pool.
+        # In baseline mode: remove stale lost tracks using original ByteTrack policy.
+        new_lost_stracks = []
+        for track in self.lost_stracks:
+            frames_lost = self.frame_count - track.lost_frame_id
+            if self.exit_zone_enabled and bool(getattr(track, 'exit_pending', False)):
+                grace = max(1, int(self.exit_zone_remove_grace))
+                if frames_lost >= grace:
+                    track.mark_removed()
+                    removed_stracks.append(track)
+                    self._set_exit_pending(track, False)
+                    continue
+            if zombie_enabled:
+                if frames_lost >= self.zombie_transition_frames:
+                    # This track would be removed in original ByteTrack
+                    # Instead, move it to zombie_stracks for potential later rescue
+                    if track.frozen_mean is None:
+                        track.frozen_mean = track.mean.copy()
+                    self.zombie_stracks.append(track)
+                else:
+                    new_lost_stracks.append(track)
+            else:
+                if frames_lost > self.max_time_lost:
+                    track.mark_removed()
+                    self._set_exit_pending(track, False)
+                    removed_stracks.append(track)
+                else:
+                    new_lost_stracks.append(track)
+        self.lost_stracks = new_lost_stracks
+
+        """ Step 7: Remove rescued zombies from zombie_stracks """
         if rescued_zombies:
             rescued_ids = {t.id for t in rescued_zombies}
-            self.lost_stracks = [t for t in self.lost_stracks if t.id not in rescued_ids]
+            self.zombie_stracks = [t for t in self.zombie_stracks if t.id not in rescued_ids]
 
-        """ Step 6: Freeze zombie positions after max prediction frames """
-        for track in self.lost_stracks:
-            if track.lost_frame_id > 0 and track.frozen_mean is None:
-                frames_lost = self.frame_count - track.lost_frame_id
-                if frames_lost >= self.zombie_max_predict_frames:
-                    # Freeze the mean at current position
-                    track.frozen_mean = track.mean.copy()
-
-        """ Step 7: Limit max zombie history (prevent memory growth) """
-        if len(self.lost_stracks) > self.zombie_max_history:
-            # Sort by lost_frame_id (oldest first) and remove oldest
-            self.lost_stracks.sort(key=lambda t: t.lost_frame_id)
-            tracks_to_remove = self.lost_stracks[:-self.zombie_max_history]
+        """ Step 8: Limit max zombie history """
+        if not zombie_enabled and self.zombie_stracks:
+            # Ensure baseline mode does not keep any zombie state.
+            for track in self.zombie_stracks:
+                track.mark_removed()
+                removed_stracks.append(track)
+            self.zombie_stracks = []
+        elif len(self.zombie_stracks) > self.zombie_max_history:
+            self.zombie_stracks.sort(key=lambda t: t.lost_frame_id)
+            tracks_to_remove = self.zombie_stracks[:-self.zombie_max_history]
             for track in tracks_to_remove:
                 track.mark_removed()
                 removed_stracks.append(track)
-            self.lost_stracks = self.lost_stracks[-self.zombie_max_history:]
+            self.zombie_stracks = self.zombie_stracks[-self.zombie_max_history:]
+
+        """ Step 9: Limit max lost tracks history """
+        if self.lost_max_history > 0 and len(self.lost_stracks) > self.lost_max_history:
+            self.lost_stracks.sort(key=lambda t: t.lost_frame_id)
+            tracks_to_remove = self.lost_stracks[:-self.lost_max_history]
+            for track in tracks_to_remove:
+                track.mark_removed()
+                removed_stracks.append(track)
+            self.lost_stracks = self.lost_stracks[-self.lost_max_history:]
 
         self.active_tracks = [
             t for t in self.active_tracks if t.state == TrackState.Tracked
@@ -533,9 +887,11 @@ class ByteTrack(BaseTracker):
         self.active_tracks = joint_stracks(self.active_tracks, activated_starcks)
         self.active_tracks = joint_stracks(self.active_tracks, refind_stracks)
         self.lost_stracks = sub_stracks(self.lost_stracks, self.active_tracks)
-        self.lost_stracks.extend(lost_stracks)
-        self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
+        # Note: lost_stracks are added to self.lost_stracks in Step 5
+        # So we don't need to extend again here
         self.removed_stracks.extend(removed_stracks)
+        self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
+        self.zombie_stracks = sub_stracks(self.zombie_stracks, self.active_tracks)
         self.active_tracks, self.lost_stracks = remove_duplicate_stracks(
             self.active_tracks, self.lost_stracks
         )

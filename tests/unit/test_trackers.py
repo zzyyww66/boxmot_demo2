@@ -12,6 +12,7 @@ from boxmot import (
 from boxmot.trackers.deepocsort.deepocsort import (
     KalmanBoxTracker as DeepOCSortKalmanBoxTracker,
 )
+from boxmot.trackers.bytetrack.bytetrack import ByteTrack
 from boxmot.trackers.ocsort.ocsort import KalmanBoxTracker as OCSortKalmanBoxTracker
 from boxmot.utils import WEIGHTS
 from tests.test_config import (
@@ -294,3 +295,98 @@ def test_create_tracker_invalid_tracker_name():
         )
 
 
+def test_bytetrack_adaptive_zone_always_expand_grows_monotonically():
+    tracker = ByteTrack(
+        entry_margin=50,
+        strict_entry_gate=True,
+        adaptive_zone_enabled=True,
+        adaptive_zone_update_mode="always_expand",
+        adaptive_zone_expand_trigger="all_high",
+        adaptive_zone_padding=1.0,
+        adaptive_zone_min_box_area=0,
+        zombie_max_history=0,
+    )
+    img = np.zeros((1000, 1000, 3), dtype=np.uint8)
+
+    det1 = np.array([[450, 450, 500, 550, 0.95, 0]], dtype=np.float32)
+    tracker.update(det1, img)
+    assert tracker._effective_zone is not None
+    z1 = tracker._effective_zone.copy()
+
+    det2 = np.array([[700, 450, 750, 550, 0.95, 0]], dtype=np.float32)
+    tracker.update(det2, img)
+    z2 = tracker._effective_zone.copy()
+
+    assert z2[0] <= z1[0]
+    assert z2[1] <= z1[1]
+    assert z2[2] >= z1[2]
+    assert z2[3] >= z1[3]
+    assert z2[2] >= 750
+
+
+def test_bytetrack_outside_before_expand_keeps_new_id_creation():
+    tracker = ByteTrack(
+        entry_margin=50,
+        strict_entry_gate=True,
+        adaptive_zone_enabled=True,
+        adaptive_zone_update_mode="always_expand",
+        adaptive_zone_expand_trigger="all_high",
+        adaptive_zone_padding=1.0,
+        adaptive_zone_min_box_area=0,
+        zombie_max_history=0,
+    )
+    img = np.zeros((1000, 1000, 3), dtype=np.uint8)
+
+    # Frame 1 initializes effective zone around center.
+    out1 = tracker.update(np.array([[450, 450, 500, 550, 0.95, 0]], dtype=np.float32), img)
+    assert out1.shape[0] == 1
+    id1 = int(out1[0, 4])
+
+    # Frame 2 high-conf detection was outside previous effective zone.
+    # In always_expand+all_high mode the zone expands before step4; the new
+    # outside-before-expand marker ensures this detection gets activated.
+    out2 = tracker.update(np.array([[700, 450, 750, 550, 0.95, 0]], dtype=np.float32), img)
+    assert out2.shape[0] == 0  # non-first-frame activation is unconfirmed until next frame
+    assert tracker._outside_zone_det_inds
+
+    # Frame 3 repeats the same detection to confirm the new track and expose ID in output.
+    out3 = tracker.update(np.array([[700, 450, 750, 550, 0.95, 0]], dtype=np.float32), img)
+    assert out3.shape[0] == 1
+    id3 = int(out3[0, 4])
+    assert id3 != id1
+
+
+def test_bytetrack_exit_zone_margin_zero_is_disabled():
+    tracker = ByteTrack(
+        exit_zone_enabled=True,
+        exit_zone_margin=0,
+        zombie_max_history=0,
+    )
+    assert tracker._is_in_exit_zone(np.array([100, 100, 50, 80], dtype=np.float32), (1000, 1000)) is False
+
+
+def test_bytetrack_exit_zone_remove_grace_delays_removal():
+    tracker = ByteTrack(
+        entry_margin=0,
+        strict_entry_gate=False,
+        exit_zone_enabled=True,
+        exit_zone_margin=50,
+        exit_zone_remove_grace=3,
+        zombie_max_history=0,
+    )
+    img = np.zeros((1000, 1000, 3), dtype=np.uint8)
+    det = np.array([[5, 100, 55, 220, 0.95, 0]], dtype=np.float32)
+    empty = np.empty((0, 6), dtype=np.float32)
+
+    out1 = tracker.update(det, img)
+    assert out1.shape[0] == 1
+
+    tracker.update(empty, img)
+    assert len(tracker.lost_stracks) == 1
+    assert len(tracker.removed_stracks) == 0
+    assert bool(getattr(tracker.lost_stracks[0], "exit_pending", False))
+
+    tracker.update(empty, img)
+    tracker.update(empty, img)
+    tracker.update(empty, img)
+    assert len(tracker.removed_stracks) >= 1
