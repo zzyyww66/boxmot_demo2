@@ -13,8 +13,12 @@ SEQ_SRC = Path("boxmot/engine/trackeval/MOT17-ablation/train/MOT17-04")
 SUBSET_ROOT = PROJECT_DIR / "_mot17_04_subset"
 
 IMPROVED_CONFIG = {
+    "new_track_thresh": 0.65,
     "entry_margin": 50,
     "strict_entry_gate": False,
+    "birth_confirm_frames": 2,
+    "birth_suppress_iou": 0.7,
+    "birth_suppress_center_dist": 35,
     "zombie_max_history": 100,
     "zombie_dist_thresh": 150,
     "zombie_max_predict_frames": 5,

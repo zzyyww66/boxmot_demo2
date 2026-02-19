@@ -390,3 +390,111 @@ def test_bytetrack_exit_zone_remove_grace_delays_removal():
     tracker.update(empty, img)
     tracker.update(empty, img)
     assert len(tracker.removed_stracks) >= 1
+
+
+def test_bytetrack_new_track_thresh_blocks_low_conf_birth():
+    tracker = ByteTrack(
+        track_thresh=0.45,
+        new_track_thresh=0.8,
+        entry_margin=0,
+        strict_entry_gate=False,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    low_birth = np.array([[100, 100, 180, 260, 0.7, 0]], dtype=np.float32)
+    high_birth = np.array([[100, 100, 180, 260, 0.9, 0]], dtype=np.float32)
+
+    out1 = tracker.update(low_birth, img)
+    assert out1.shape[0] == 0
+    assert len(tracker.active_tracks) == 0
+
+    out2 = tracker.update(high_birth, img)
+    assert out2.shape[0] == 0
+
+    out3 = tracker.update(high_birth, img)
+    assert out3.shape[0] == 1
+
+
+def test_bytetrack_birth_confirm_requires_two_hits():
+    tracker = ByteTrack(
+        new_track_thresh=0.6,
+        birth_confirm_frames=2,
+        entry_margin=0,
+        strict_entry_gate=False,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    empty = np.empty((0, 6), dtype=np.float32)
+    det = np.array([[200, 120, 260, 260, 0.9, 0]], dtype=np.float32)
+
+    tracker.update(empty, img)
+    out2 = tracker.update(det, img)
+    assert out2.shape[0] == 0
+    assert len(tracker.pending_births) == 1
+    assert len(tracker.active_tracks) == 0
+
+    out3 = tracker.update(det, img)
+    assert out3.shape[0] == 0
+    assert len(tracker.pending_births) == 0
+    assert len(tracker.active_tracks) == 1
+
+    out4 = tracker.update(det, img)
+    assert out4.shape[0] == 1
+
+
+def test_bytetrack_birth_duplicate_suppression_blocks_double_id():
+    tracker = ByteTrack(
+        entry_margin=0,
+        strict_entry_gate=False,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        birth_confirm_frames=1,
+        birth_suppress_iou=0.7,
+        birth_suppress_center_dist=0,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    det1 = np.array([[100, 100, 160, 240, 0.95, 0]], dtype=np.float32)
+    det_dup = np.array(
+        [
+            [100, 100, 160, 240, 0.95, 0],
+            [102, 102, 162, 242, 0.93, 0],
+        ],
+        dtype=np.float32,
+    )
+
+    out1 = tracker.update(det1, img)
+    assert out1.shape[0] == 1
+
+    out2 = tracker.update(det_dup, img)
+    assert out2.shape[0] == 1
+
+    out3 = tracker.update(det_dup, img)
+    assert out3.shape[0] == 1
+    assert len(tracker.active_tracks) == 1
+
+
+def test_bytetrack_pending_birth_expires_without_consecutive_confirmation():
+    tracker = ByteTrack(
+        new_track_thresh=0.6,
+        birth_confirm_frames=2,
+        entry_margin=0,
+        strict_entry_gate=False,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    empty = np.empty((0, 6), dtype=np.float32)
+    det = np.array([[260, 140, 320, 280, 0.92, 0]], dtype=np.float32)
+
+    tracker.update(empty, img)
+    tracker.update(det, img)
+    assert len(tracker.pending_births) == 1
+
+    tracker.update(empty, img)
+    tracker.update(det, img)
+    assert len(tracker.pending_births) == 1
+    assert len(tracker.active_tracks) == 0

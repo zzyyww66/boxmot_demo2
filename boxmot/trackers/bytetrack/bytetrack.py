@@ -138,6 +138,10 @@ class STrack(BaseTrack):
             return xywh2tlwh(ret)
 
         # Otherwise use current state (normal prediction)
+        if self.mean is not None:
+            ret = self.mean[:4].copy()
+            ret[2] *= ret[3]  # (xc, yc, a, h) -> (xc, yc, w, h)
+            return xywh2tlwh(ret)
         return self.tlwh
 
 
@@ -160,10 +164,14 @@ class ByteTrack(BaseTracker):
     - min_conf (float): Threshold for detection confidence. Detections below this threshold are discarded.
     - track_thresh (float): Threshold for detection confidence. Detections above this threshold are considered for tracking in the first association round.
     - match_thresh (float): Threshold for the matching step in data association. Controls the maximum distance allowed between tracklets and detections for a match.
+    - new_track_thresh (float): Threshold for creating a new track from unmatched detections (default: track_thresh).
     - track_buffer (int): Number of frames to keep a track alive after it was last detected.
     - frame_rate (int): Frame rate of the video being processed. Used to scale the track buffer size.
     - entry_margin (int): Pixel width of entry zone at frame edges. New IDs are only created within this margin (birth control). Set to 0 to disable (default: 0).
     - strict_entry_gate (bool): If True, unmatched center-zone detections do NOT create new IDs when entry gating is enabled (default: False).
+    - birth_confirm_frames (int): Number of consecutive candidate hits required before activating a new ID (default: 1, i.e., disabled).
+    - birth_suppress_iou (float): Suppress new births if IoU with existing tracks exceeds this threshold (<=0 disables).
+    - birth_suppress_center_dist (float): Suppress new births if center distance to existing tracks is below this threshold in pixels (<=0 disables).
 
     Exit zone parameters:
     - exit_zone_enabled (bool): Enable exit zone feature. When a track disappears in the exit zone (frame edges), it enters exit-pending and can be removed after grace frames (default: False).
@@ -215,6 +223,7 @@ class ByteTrack(BaseTracker):
         self.track_thresh = track_thresh
         self.match_thresh = match_thresh
         self.det_thresh = track_thresh  # Same as track_thresh
+        self.new_track_thresh = kwargs.get('new_track_thresh', self.track_thresh)
 
         # Motion model
         self.kalman_filter = KalmanFilterXYAH()
@@ -231,6 +240,13 @@ class ByteTrack(BaseTracker):
         self.zombie_transition_frames = kwargs.get('zombie_transition_frames', self.buffer_size)  # 转为僵尸的帧数阈值
         self.zombie_match_max_dist = kwargs.get('zombie_match_max_dist', 200)  # 僵尸匹配距离上限（像素）
         self.lost_max_history = kwargs.get('lost_max_history', 0)  # 0 means unlimited
+
+        # Soft birth gating (optional, disabled by default for backwards compatibility)
+        self.birth_confirm_frames = max(1, int(kwargs.get('birth_confirm_frames', 1)))
+        self.birth_suppress_iou = float(kwargs.get('birth_suppress_iou', 0.0))
+        self.birth_suppress_center_dist = float(kwargs.get('birth_suppress_center_dist', 0.0))
+        self._birth_confirm_iou = 0.3
+        self._birth_pending_max_miss = 1
 
         # Exit zone configuration
         self.exit_zone_enabled = kwargs.get('exit_zone_enabled', False)
@@ -255,6 +271,7 @@ class ByteTrack(BaseTracker):
         self.active_tracks = []  # type: list[STrack]
         self.lost_stracks = []  # type: list[STrack]
         self.zombie_stracks = []  # type: list[STrack]
+        self.pending_births = []  # type: list[dict]
         self.removed_stracks = []  # type: list[STrack]
 
     def _zombie_enabled(self) -> bool:
@@ -583,6 +600,115 @@ class ByteTrack(BaseTracker):
 
         return None
 
+    def _prune_pending_births(self):
+        """Drop stale pending birth candidates that missed too many consecutive frames."""
+        if not self.pending_births:
+            return
+        keep = []
+        for pending in self.pending_births:
+            if self.frame_count - pending["last_frame"] <= self._birth_pending_max_miss:
+                keep.append(pending)
+        self.pending_births = keep
+
+    def _collect_birth_reference_tracks(self, *track_groups):
+        """Build a deduplicated list of tracks used to suppress duplicate new births."""
+        refs = []
+        seen = set()
+        for group in track_groups:
+            for track in group:
+                if track is None or track.state == TrackState.Removed:
+                    continue
+                key = id(track)
+                if key in seen:
+                    continue
+                seen.add(key)
+                refs.append(track)
+        return refs
+
+    def _is_birth_suppressed(self, det_track, reference_tracks) -> bool:
+        """Check whether a new birth candidate is too close to existing tracks."""
+        if self.birth_suppress_iou <= 0 and self.birth_suppress_center_dist <= 0:
+            return False
+
+        det_tlwh = det_track.tlwh
+
+        for ref_track in reference_tracks:
+            if ref_track is det_track:
+                continue
+            ref_tlwh = ref_track.get_tlwh_for_matching(
+                frame_id=self.frame_count,
+                max_predict_frames=self.zombie_max_predict_frames
+            )
+            if self.birth_suppress_iou > 0:
+                if self._calculate_iou(det_tlwh, ref_tlwh) >= self.birth_suppress_iou:
+                    return True
+            if self.birth_suppress_center_dist > 0:
+                if self._calculate_center_distance(det_tlwh, ref_tlwh) <= self.birth_suppress_center_dist:
+                    return True
+
+        return False
+
+    def _find_pending_birth_idx(self, det_track):
+        """Find best pending candidate for current detection."""
+        if not self.pending_births:
+            return -1
+
+        max_dist = self.birth_suppress_center_dist if self.birth_suppress_center_dist > 0 else 40.0
+        best_idx = -1
+        best_iou = -1.0
+        best_dist = float("inf")
+
+        for idx, pending in enumerate(self.pending_births):
+            pending_track = pending["track"]
+            iou = self._calculate_iou(det_track.tlwh, pending_track.tlwh)
+            dist = self._calculate_center_distance(det_track.tlwh, pending_track.tlwh)
+            if iou < self._birth_confirm_iou and dist > max_dist:
+                continue
+
+            if iou > best_iou or (np.isclose(iou, best_iou) and dist < best_dist):
+                best_idx = idx
+                best_iou = iou
+                best_dist = dist
+
+        return best_idx
+
+    def _try_activate_new_track(self, det_track, activated_starcks, reference_tracks):
+        """Apply duplicate suppression and temporal confirmation before spawning a new ID."""
+        if self.birth_confirm_frames <= 1:
+            if self._is_birth_suppressed(det_track, reference_tracks):
+                return False
+            det_track.activate(self.kalman_filter, self.frame_count)
+            self._set_exit_pending(det_track, False)
+            activated_starcks.append(det_track)
+            return True
+
+        pending_idx = self._find_pending_birth_idx(det_track)
+        if self._is_birth_suppressed(det_track, reference_tracks):
+            return False
+        if pending_idx < 0:
+            self.pending_births.append(
+                {
+                    "track": det_track,
+                    "hits": 1,
+                    "last_frame": self.frame_count,
+                }
+            )
+            return False
+
+        pending = self.pending_births.pop(pending_idx)
+        hits = pending["hits"] + 1
+        if hits >= self.birth_confirm_frames:
+            det_track.activate(self.kalman_filter, self.frame_count)
+            self._set_exit_pending(det_track, False)
+            activated_starcks.append(det_track)
+            return True
+
+        pending["track"] = det_track
+        pending["hits"] = hits
+        pending["last_frame"] = self.frame_count
+        self.pending_births.append(pending)
+        return False
+
     @BaseTracker.setup_decorator
     @BaseTracker.per_class_decorator
     def update(
@@ -594,6 +720,7 @@ class ByteTrack(BaseTracker):
         dets = np.hstack([dets, np.arange(len(dets)).reshape(-1, 1)])
         self.frame_count += 1
         self._outside_zone_det_inds = set()
+        self._prune_pending_births()
 
         # Store image dimensions for adaptive zone computation
         if img is not None:
@@ -748,7 +875,7 @@ class ByteTrack(BaseTracker):
             # First frame: give all detections new IDs
             for inew in u_detection:
                 det_track = detections[inew]
-                if det_track.conf < self.det_thresh:
+                if det_track.conf < self.new_track_thresh:
                     continue
                 det_track.activate(self.kalman_filter, self.frame_count)
                 activated_starcks.append(det_track)
@@ -756,7 +883,7 @@ class ByteTrack(BaseTracker):
             # Normal frames: process unmatched detections
             for inew in u_detection:
                 det_track = detections[inew]
-                if det_track.conf < self.det_thresh:
+                if det_track.conf < self.new_track_thresh:
                     continue
 
                 # In always_expand mode, unmatched-high trigger can expand zone in step4.
@@ -774,8 +901,15 @@ class ByteTrack(BaseTracker):
                     and self.adaptive_zone_update_mode == 'always_expand'
                     and int(det_track.det_ind) in self._outside_zone_det_inds
                 ):
-                    det_track.activate(self.kalman_filter, self.frame_count)
-                    activated_starcks.append(det_track)
+                    birth_refs = self._collect_birth_reference_tracks(
+                        self.active_tracks,
+                        self.lost_stracks,
+                        self.zombie_stracks,
+                        activated_starcks,
+                        refind_stracks,
+                        lost_stracks,
+                    )
+                    self._try_activate_new_track(det_track, activated_starcks, birth_refs)
                     continue
 
                 det_tlwh = det_track.tlwh
@@ -783,9 +917,15 @@ class ByteTrack(BaseTracker):
 
                 if is_entry:
                     # In entry zone -> create new ID (original behavior)
-                    det_track.activate(self.kalman_filter, self.frame_count)
-                    self._set_exit_pending(det_track, False)
-                    activated_starcks.append(det_track)
+                    birth_refs = self._collect_birth_reference_tracks(
+                        self.active_tracks,
+                        self.lost_stracks,
+                        self.zombie_stracks,
+                        activated_starcks,
+                        refind_stracks,
+                        lost_stracks,
+                    )
+                    self._try_activate_new_track(det_track, activated_starcks, birth_refs)
                 else:
                     # In center zone -> try match with zombie tracks
                     # Zombie tracks are those lost for > 30 frames
@@ -799,9 +939,15 @@ class ByteTrack(BaseTracker):
                         # This is the core "严进" policy for fixed-camera deployments.
                         if self.strict_entry_gate and self.entry_margin > 0:
                             continue
-                        det_track.activate(self.kalman_filter, self.frame_count)
-                        self._set_exit_pending(det_track, False)
-                        activated_starcks.append(det_track)
+                        birth_refs = self._collect_birth_reference_tracks(
+                            self.active_tracks,
+                            self.lost_stracks,
+                            self.zombie_stracks,
+                            activated_starcks,
+                            refind_stracks,
+                            lost_stracks,
+                        )
+                        self._try_activate_new_track(det_track, activated_starcks, birth_refs)
 
         """ Step 5: Update lost tracks and transition to zombie """
         # Add newly lost tracks to self.lost_stracks

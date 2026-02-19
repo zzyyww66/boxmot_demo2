@@ -8,6 +8,11 @@ track_thresh:
   default: 0.6
   range: [0.4, 0.7]
 
+new_track_thresh:
+  type: uniform
+  default: 0.6
+  range: [0.4, 0.9]
+
 track_buffer:
   type: qrandint
   default: 30
@@ -28,6 +33,26 @@ entry_margin:
   type: qrandint
   default: 0  # disabled
   range: [0, 101, 10]
+
+strict_entry_gate:
+  type: choice
+  default: false
+  options: [true, false]
+
+birth_confirm_frames:
+  type: qrandint
+  default: 1
+  range: [1, 4, 1]
+
+birth_suppress_iou:
+  type: uniform
+  default: 0.0
+  range: [0.0, 0.9]
+
+birth_suppress_center_dist:
+  type: qrandint
+  default: 0
+  range: [0, 101, 5]
 
 zombie_max_history:
   type: qrandint

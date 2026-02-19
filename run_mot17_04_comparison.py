@@ -21,8 +21,12 @@ SUBSET_ROOT = PROJECT_DIR / "_mot17_04_subset"
 
 
 BASELINE_CONFIG = {
+    "new_track_thresh": 0.6,
     "entry_margin": 0,
     "strict_entry_gate": False,
+    "birth_confirm_frames": 1,
+    "birth_suppress_iou": 0.0,
+    "birth_suppress_center_dist": 0,
     "zombie_max_history": 0,
     "zombie_dist_thresh": 999999,
     "zombie_max_predict_frames": 0,
@@ -40,8 +44,12 @@ BASELINE_CONFIG = {
 
 
 IMPROVED_CONFIG = {
+    "new_track_thresh": 0.65,
     "entry_margin": 50,
     "strict_entry_gate": False,
+    "birth_confirm_frames": 2,
+    "birth_suppress_iou": 0.7,
+    "birth_suppress_center_dist": 35,
     "zombie_max_history": 100,
     "zombie_dist_thresh": 150,
     "zombie_max_predict_frames": 5,

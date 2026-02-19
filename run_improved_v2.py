@@ -10,7 +10,11 @@ TRACKER_YAML = Path("boxmot/configs/trackers/bytetrack.yaml")
 
 # Conservative config - disable entry zone, larger thresholds
 IMPROVED_CONFIG_V2 = {
+    "new_track_thresh": 0.65,
     "entry_margin": 0,              # Disable entry zone restriction
+    "birth_confirm_frames": 2,
+    "birth_suppress_iou": 0.7,
+    "birth_suppress_center_dist": 35,
     "zombie_max_history": 100,
     "zombie_dist_thresh": 250,      # Larger distance threshold
     "zombie_max_predict_frames": 5,
