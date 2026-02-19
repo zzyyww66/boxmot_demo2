@@ -17,12 +17,10 @@ from pathlib import Path
 # Configuration for the two test variants
 BASELINE_CONFIG = {
     "entry_margin": 0,
-    "zombie_iou_thresh": 0.3,
 }
 
 GATING_CONFIG = {
     "entry_margin": 50,
-    "zombie_iou_thresh": 0.3,
 }
 
 

@@ -31,13 +31,8 @@ entry_margin:
 
 strict_entry_gate:
   type: choice
-  default: true
+  default: false
   options: [true, false]
-
-zombie_iou_thresh:
-  type: uniform
-  default: 0.3
-  range: [0.1, 0.5]
 
 zombie_max_history:
   type: qrandint

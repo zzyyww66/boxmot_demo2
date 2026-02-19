@@ -29,11 +29,6 @@ entry_margin:
   default: 50
   range: [0, 101, 10]
 
-zombie_iou_thresh:
-  type: uniform
-  default: 0.3
-  range: [0.1, 0.5]
-
 zombie_max_history:
   type: qrandint
   default: 100

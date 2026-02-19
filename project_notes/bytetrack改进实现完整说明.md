@@ -142,7 +142,6 @@
 BASELINE_CONFIG = {
     "entry_margin": 0,
     "strict_entry_gate": False,
-    "zombie_iou_thresh": 0.3,
     "zombie_max_history": 0,
     "zombie_dist_thresh": 999999,
     "zombie_max_predict_frames": 0,
@@ -165,7 +164,6 @@ BASELINE_CONFIG = {
 IMPROVED_CONFIG = {
     "entry_margin": 50,
     "strict_entry_gate": True,
-    "zombie_iou_thresh": 0.3,
     "zombie_max_history": 100,
     "zombie_dist_thresh": 150,
     "zombie_max_predict_frames": 5,

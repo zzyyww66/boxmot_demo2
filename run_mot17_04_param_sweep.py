@@ -3,7 +3,7 @@
 MOT17-04 parameter sweep for improved ByteTrack configuration.
 
 Search strategy:
-1) Phase A: 18 single-factor trials around current improved config
+1) Phase A: 16 single-factor trials around current improved config
 2) Phase B: 12 interaction trials from top-4 sensitive parameters
 3) Re-run top-3 candidates twice for stability
 
@@ -105,7 +105,6 @@ def phase_a_cases(base: dict) -> list[dict]:
         ("exit_zone_remove_grace", [24, 36, 42]),
         ("zombie_dist_thresh", [130, 170]),
         ("zombie_max_predict_frames", [4, 6]),
-        ("zombie_iou_thresh", [0.25, 0.35]),
         ("adaptive_zone_expand_trigger", ["outside_high"]),
         ("adaptive_zone_margin", [40, 60]),
         ("adaptive_zone_min_box_area", [200, 400]),
@@ -127,7 +126,7 @@ def phase_a_cases(base: dict) -> list[dict]:
                 }
             )
             idx += 1
-    assert len(cases) == 18
+    assert len(cases) == 16
     return cases
 
 

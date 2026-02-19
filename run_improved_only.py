@@ -14,8 +14,7 @@ SUBSET_ROOT = PROJECT_DIR / "_mot17_04_subset"
 
 IMPROVED_CONFIG = {
     "entry_margin": 50,
-    "strict_entry_gate": True,
-    "zombie_iou_thresh": 0.3,
+    "strict_entry_gate": False,
     "zombie_max_history": 100,
     "zombie_dist_thresh": 150,
     "zombie_max_predict_frames": 5,

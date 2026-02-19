@@ -5,7 +5,6 @@
 ### Baseline (Original ByteTrack)
 ```yaml
 entry_margin: 0              # First frame handling disabled
-zombie_iou_thresh: 0.3       # Not used (entry_margin=0)
 zombie_max_history: 0        # Zombie rescue disabled
 zombie_dist_thresh: 999999   # Not used
 zombie_max_predict_frames: 0 # Zombie prediction disabled
@@ -14,7 +13,6 @@ zombie_max_predict_frames: 0 # Zombie prediction disabled
 ### Improved (With New Features)
 ```yaml
 entry_margin: 50             # First 50 frames: all detections get new ID
-zombie_iou_thresh: 0.3       # IoU threshold for zombie matching
 zombie_max_history: 100      # Keep up to 100 zombie tracks
 zombie_dist_thresh: 150      # Center distance threshold for zombie matching
 zombie_max_predict_frames: 5 # Max 5 frames of Kalman prediction for zombies

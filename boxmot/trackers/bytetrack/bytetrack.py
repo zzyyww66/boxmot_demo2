@@ -163,8 +163,7 @@ class ByteTrack(BaseTracker):
     - track_buffer (int): Number of frames to keep a track alive after it was last detected.
     - frame_rate (int): Frame rate of the video being processed. Used to scale the track buffer size.
     - entry_margin (int): Pixel width of entry zone at frame edges. New IDs are only created within this margin (birth control). Set to 0 to disable (default: 0).
-    - strict_entry_gate (bool): If True, unmatched center-zone detections do NOT create new IDs when entry gating is enabled (default: True).
-    - zombie_iou_thresh (float): IoU threshold for rescuing lost tracks (zombie rescue). Higher values require better spatial overlap to reactivate a lost track (default: 0.3).
+    - strict_entry_gate (bool): If True, unmatched center-zone detections do NOT create new IDs when entry gating is enabled (default: False).
 
     Exit zone parameters:
     - exit_zone_enabled (bool): Enable exit zone feature. When a track disappears in the exit zone (frame edges), it enters exit-pending and can be removed after grace frames (default: False).
@@ -222,9 +221,7 @@ class ByteTrack(BaseTracker):
 
         # Lifecycle gating configuration (scene-mask based birth control and zombie rescue)
         self.entry_margin = kwargs.get('entry_margin', 0)  # Entry zone pixel width (0 = disabled)
-        self.strict_entry_gate = kwargs.get('strict_entry_gate', True)  # Center unmatched detections cannot spawn IDs when gating is on
-        self.zombie_iou_thresh = kwargs.get('zombie_iou_thresh', 0.3)  # IoU threshold for zombie rescue
-
+        self.strict_entry_gate = kwargs.get('strict_entry_gate', False)  # Center unmatched detections cannot spawn IDs when gating is on
         # Zombie track management parameters
         self.zombie_max_history = kwargs.get('zombie_max_history', 100)  # Max number of zombie tracks to keep
         self.zombie_dist_thresh = kwargs.get('zombie_dist_thresh', 150)  # Distance threshold for zombie rescue (pixels)
