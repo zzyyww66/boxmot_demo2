@@ -1,0 +1,137 @@
+min_conf:
+  type: uniform
+  default: 0.1
+  range: [0.1, 0.3]
+
+track_thresh:
+  type: uniform
+  default: 0.6
+  range: [0.4, 0.7]
+
+new_track_thresh:
+  type: uniform
+  default: 0.65
+  range: [0.4, 0.9]
+
+track_buffer:
+  type: qrandint
+  default: 30
+  range: [10, 61, 10]
+
+match_thresh:
+  type: uniform
+  default: 0.9
+  range: [0.7, 0.9]
+
+frame_rate:
+  type: choice
+  default: 30
+  options: [25, 30]
+
+# Baseline config: disable new features
+entry_margin:
+  type: qrandint
+  default: 50  # enable effective entry region margin (matches final tuned setup)
+  range: [0, 101, 10]
+
+strict_entry_gate:
+  type: choice
+  default: false
+  options: [true, false]
+
+birth_confirm_frames:
+  type: qrandint
+  default: 2  # enabled two-hit confirmation
+  range: [1, 4, 1]
+
+birth_suppress_iou:
+  type: uniform
+  default: 0.7
+  range: [0.0, 0.9]
+
+birth_suppress_center_dist:
+  type: qrandint
+  default: 35
+  range: [0, 101, 5]
+
+zombie_max_history:
+  type: qrandint
+  default: 100
+  range: [50, 201, 10]
+
+zombie_dist_thresh:
+  type: qrandint
+  default: 150
+  range: [50, 301, 10]
+
+zombie_transition_frames:
+  type: qrandint
+  default: 30  # 转为僵尸的帧数阈值，默认等于buffer_size
+  range: [20, 61, 5]
+
+lost_max_history:
+  type: qrandint
+  default: 0  # 0 means unlimited
+  range: [0, 401, 20]
+
+zombie_match_max_dist:
+  type: qrandint
+  default: 200  # 僵尸匹配距离上限（像素）
+  range: [100, 301, 20]
+
+zombie_max_predict_frames:
+  type: qrandint
+  default: 5
+  range: [3, 11, 1]
+
+# Exit zone configuration
+exit_zone_enabled:
+  type: choice
+  default: true
+  options: [true, false]
+
+exit_zone_margin:
+  type: qrandint
+  default: 50  # exit zone margin (pixels), can share with entry_margin
+  range: [0, 101, 10]
+
+exit_zone_remove_grace:
+  type: qrandint
+  default: 30  # grace frames before removing an exit-pending lost track
+  range: [1, 31, 1]
+
+# Adaptive effective zone configuration
+adaptive_zone_enabled:
+  type: choice
+  default: true
+  options: [true, false]
+
+adaptive_zone_update_mode:
+  type: choice
+  default: always_expand
+  options: [always_expand, warmup_once]
+
+adaptive_zone_expand_trigger:
+  type: choice
+  default: all_high
+  options: [all_high, outside_high, unmatched_high]
+
+adaptive_zone_warmup:
+  type: qrandint
+  default: 10
+  range: [5, 31, 1]
+
+adaptive_zone_margin:
+  type: qrandint
+  default: 50
+  range: [20, 101, 10]
+
+adaptive_zone_padding:
+  type: uniform
+  default: 1.2
+  range: [1.0, 1.5]
+
+adaptive_zone_min_box_area:
+  type: qrandint
+  default: 0
+  range: [0, 5001, 100]

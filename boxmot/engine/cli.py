@@ -82,6 +82,8 @@ def core_options(func):
                      help='reuse existing runs in CI (no UI)'),
         click.option('--tracking-method', type=str, default='deepocsort',
                      help='deepocsort, botsort, strongsort, ...'),
+        click.option('--tracker-config', type=Path, default=None,
+                     help='optional tracker config YAML path (overrides default tracker config)'),
         click.option('--verbose', is_flag=True,
                      help='print detailed logs'),
         click.option('--agnostic-nms', is_flag=True,

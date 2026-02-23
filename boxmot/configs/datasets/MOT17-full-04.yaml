@@ -1,0 +1,18 @@
+# Full MOT17 dataset config (local path), evaluating only MOT17-04
+# Dataset path provided by user.
+download:
+  runs_url: null
+  dataset_url: null
+
+benchmark:
+  source: "/home/zyw/code/boxmot_demo2/.venv/lib/python3.11/site-packages/trackeval/MOT17"
+  split: "train"
+  sequence_filter:
+    - "MOT17-04"
+  eval_classes:
+    1: pedestrian
+  distractor_classes:
+    2: person_on_vehicle
+    7: static_person
+    8: distractor
+    12: reflection

@@ -49,6 +49,26 @@ COCO_CLASSES = [
     'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
 ]
 
+MOTION_ONLY_TRACKERS = {"bytetrack", "ocsort"}
+
+
+def is_motion_only_tracker(tracking_method: str) -> bool:
+    """Return True for trackers that do not use appearance embeddings."""
+    return str(tracking_method).lower() in MOTION_ONLY_TRACKERS
+
+
+def _normalize_sequence_filter(sequence_filter: Optional[list[str]]) -> Optional[set[str]]:
+    if not sequence_filter:
+        return None
+    normalized = {str(s).strip() for s in sequence_filter if str(s).strip()}
+    return normalized or None
+
+
+def _sequence_matches_filter(seq_name: str, sequence_filter: Optional[set[str]]) -> bool:
+    if sequence_filter is None:
+        return True
+    return any(seq_name == token or seq_name.startswith(f"{token}-") for token in sequence_filter)
+
 
 def load_dataset_cfg(name: str) -> dict:
     """Load the dict from boxmot/configs/datasets/{name}.yaml."""
@@ -67,12 +87,25 @@ def eval_init(args,
     data for ablation runs, then canonicalize args.source.
     Modifies args in place.
     """
+    # Track optional config metadata for downstream filtering/behavior.
+    if not hasattr(args, "dataset_config_name"):
+        args.dataset_config_name = None
+    if not hasattr(args, "sequence_filter"):
+        args.sequence_filter = None
+
     # 1) download the TrackEval code
     download_trackeval(dest=trackeval_dest, branch=branch, overwrite=overwrite)
 
     # 2) if doing MOT17/20-ablation, pull down the dataset and rewire args.source/split
     if (DATASET_CONFIGS / f"{args.source}.yaml").exists():
+        args.dataset_config_name = str(args.source)
         cfg = load_dataset_cfg(str(args.source))
+        bench_cfg = cfg.get("benchmark", {}) if isinstance(cfg, dict) else {}
+        seq_filter = bench_cfg.get("sequence_filter") if isinstance(bench_cfg, dict) else None
+        if isinstance(seq_filter, list) and seq_filter:
+            args.sequence_filter = [str(s) for s in seq_filter]
+        else:
+            args.sequence_filter = None
         
         # Determine dataset destination
         if cfg["download"]["dataset_url"]:
@@ -199,10 +232,15 @@ def _read_image_cv2(p: Path):
     return im
 
 
-def _collect_seq_info(source: Path) -> tuple[list[Path], dict[str, int]]:
+def _collect_seq_info(
+    source: Path, sequence_filter: Optional[list[str]] = None
+) -> tuple[list[Path], dict[str, int]]:
     seq_paths = []
     seq_info: dict[str, int] = {}
+    sequence_filter_set = _normalize_sequence_filter(sequence_filter)
     for seq_dir in sorted(p for p in source.iterdir() if p.is_dir()):
+        if not _sequence_matches_filter(seq_dir.name, sequence_filter_set):
+            continue
         img_dir = _sequence_img_dir(seq_dir)
         frame_files = sorted(list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.png")))
         if not frame_files:
@@ -323,10 +361,14 @@ def generate_dets_embs_batched(args: argparse.Namespace, y: Path, source_root: P
     if args.imgsz is None:
         args.imgsz = default_imgsz(y)
 
-    # Use unified DetectorReIDPipeline with timing for both detection and ReID
+    motion_only = is_motion_only_tracker(getattr(args, "tracking_method", ""))
+    sequence_filter = _normalize_sequence_filter(getattr(args, "sequence_filter", None))
+
+    # Use unified DetectorReIDPipeline with timing for both detection and ReID.
+    # For motion-only trackers, skip ReID model loading and create placeholder rows.
     pipeline = DetectorReIDPipeline(
         yolo_model_path=y,
-        reid_model_paths=args.reid_model,
+        reid_model_paths=None if motion_only else args.reid_model,
         device=args.device,
         imgsz=args.imgsz,
         half=args.half,
@@ -352,12 +394,17 @@ def generate_dets_embs_batched(args: argparse.Namespace, y: Path, source_root: P
     initial_done = 0
 
     for seq_dir in mot_folder_paths:
+        if not _sequence_matches_filter(seq_dir.name, sequence_filter):
+            continue
+
         img_dir = _sequence_img_dir(seq_dir)
         frames = _list_sequence_frames(img_dir)
         if not frames:
             continue
 
         seq_name = _sequence_name_from_img_dir(img_dir)
+        if not _sequence_matches_filter(seq_name, sequence_filter):
+            continue
 
         dets_path = dets_folder / f"{seq_name}.txt"
         processed = 0
@@ -379,9 +426,13 @@ def generate_dets_embs_batched(args: argparse.Namespace, y: Path, source_root: P
         if resume:
             det_rows = _count_data_lines(dets_path, skip_header=True)
             det_max_frame = _max_frame_id(dets_path)
-            emb_rows = {stem: _count_data_lines(ep) for stem, ep in emb_paths.items()}
-            expected_files = dets_path.exists() and all(ep.exists() for ep in emb_paths.values())
-            rows_match = len(set([det_rows, *emb_rows.values()])) == 1 if expected_files else False
+            if motion_only:
+                expected_files = dets_path.exists()
+                rows_match = True
+            else:
+                emb_rows = {stem: _count_data_lines(ep) for stem, ep in emb_paths.items()}
+                expected_files = dets_path.exists() and all(ep.exists() for ep in emb_paths.values())
+                rows_match = len(set([det_rows, *emb_rows.values()])) == 1 if expected_files else False
             if expected_files and rows_match and det_rows > 0:
                 processed = min(det_max_frame, len(frames))
             elif expected_files and not rows_match:
@@ -395,7 +446,13 @@ def generate_dets_embs_batched(args: argparse.Namespace, y: Path, source_root: P
                         pass
                 processed = 0
 
-        if resume and processed >= len(frames) and dets_path.exists() and all(ep.exists() for ep in emb_paths.values()):
+        cached_complete = (
+            resume
+            and processed >= len(frames)
+            and dets_path.exists()
+            and (motion_only or all(ep.exists() for ep in emb_paths.values()))
+        )
+        if cached_complete:
             if expected_files and rows_match and det_rows:
                 LOGGER.info(
                     f"Skipping {seq_name} (cached complete; {processed}/{len(frames)} frames)."
@@ -408,7 +465,7 @@ def generate_dets_embs_batched(args: argparse.Namespace, y: Path, source_root: P
         if resume and 0 < processed < len(frames):
             LOGGER.info(f"Resuming {seq_name}: cached {processed}/{len(frames)} frames.")
 
-        if (not resume) and dets_path.exists() and any_emb_cached:
+        if (not resume) and dets_path.exists() and (any_emb_cached or motion_only):
             if not prompt_overwrite('Detections and Embeddings', dets_path, args.ci):
                 LOGGER.debug(f"Skipping {seq_name} (cached).")
                 continue
@@ -443,8 +500,10 @@ def generate_dets_embs_batched(args: argparse.Namespace, y: Path, source_root: P
         else nullcontext()
     )
 
-    pbar = tqdm(total=total_frames, desc=f"Batched YOLO+ReID ({y.name}, bs={batch_size})", unit="frame")
-    reid_pbar = tqdm(total=0, desc="ReID embeddings", unit="det", dynamic_ncols=True)
+    pbar_desc = f"Batched YOLO ({y.name}, bs={batch_size})" if motion_only else f"Batched YOLO+ReID ({y.name}, bs={batch_size})"
+    reid_desc = "Placeholder embeddings" if motion_only else "ReID embeddings"
+    pbar = tqdm(total=total_frames, desc=pbar_desc, unit="frame")
+    reid_pbar = tqdm(total=0, desc=reid_desc, unit="det", dynamic_ncols=True)
     if initial_done:
         pbar.update(initial_done)
 
@@ -540,17 +599,23 @@ def generate_dets_embs_batched(args: argparse.Namespace, y: Path, source_root: P
                     np.savetxt(det_fhs[seq_name], dets_np, fmt="%f")
 
                     det_boxes_np = dets_np[:, 1:5]
-                    
-                    # Use pipeline's ReID models (with timing instrumentation)
-                    all_embs = pipeline.get_all_reid_features(det_boxes_np, img)
-                    for reid_name, embs in all_embs.items():
-                        if embs.shape[0] != det_boxes_np.shape[0]:
-                            raise RuntimeError(
-                                f"Embedding count mismatch: dets={det_boxes_np.shape[0]} embs={embs.shape[0]}"
-                            )
-                        if embs.ndim >= 2 and reid_name not in emb_dims:
-                            emb_dims[reid_name] = embs.shape[1]
-                        np.savetxt(emb_fhs[reid_name][seq_name], embs, fmt="%f")
+                    if motion_only:
+                        # Keep det/emb row count aligned without running feature extraction.
+                        placeholder_embs = np.zeros((det_boxes_np.shape[0], 1), dtype=np.float32)
+                        for reid_name in emb_fhs.keys():
+                            np.savetxt(emb_fhs[reid_name][seq_name], placeholder_embs, fmt="%f")
+                            emb_dims.setdefault(reid_name, 1)
+                    else:
+                        # Use pipeline's ReID models (with timing instrumentation)
+                        all_embs = pipeline.get_all_reid_features(det_boxes_np, img)
+                        for reid_name, embs in all_embs.items():
+                            if embs.shape[0] != det_boxes_np.shape[0]:
+                                raise RuntimeError(
+                                    f"Embedding count mismatch: dets={det_boxes_np.shape[0]} embs={embs.shape[0]}"
+                                )
+                            if embs.ndim >= 2 and reid_name not in emb_dims:
+                                emb_dims[reid_name] = embs.shape[1]
+                            np.savetxt(emb_fhs[reid_name][seq_name], embs, fmt="%f")
 
                     reid_pbar.update(det_boxes_np.shape[0])
 
@@ -630,9 +695,10 @@ def build_dataset_eval_settings(
     """
 
     cfg = {}
+    cfg_name = getattr(args, "dataset_config_name", None) or getattr(args, "benchmark", None)
     try:
-        if hasattr(args, "benchmark"):
-            cfg = load_dataset_cfg(args.benchmark)
+        if cfg_name:
+            cfg = load_dataset_cfg(cfg_name)
     except FileNotFoundError:
         cfg = {}
     except Exception as e:  # noqa: BLE001
@@ -766,9 +832,11 @@ def process_sequence(seq_name: str,
                      model_name: str,
                      reid_name: str,
                      tracking_method: str,
+                     tracker_config_path: Optional[str],
                      exp_folder: str,
                      target_fps: Optional[int],
                      device: str,
+                     motion_only: bool = False,
                      cfg_dict: Optional[Dict] = None,
                      ):
     """
@@ -781,9 +849,10 @@ def process_sequence(seq_name: str,
     import time
 
     device = select_device(device)
+    tracker_cfg = Path(tracker_config_path) if tracker_config_path else TRACKER_CONFIGS / (tracking_method + ".yaml")
     tracker = create_tracker(
         tracker_type=tracking_method,
-        tracker_config=TRACKER_CONFIGS / (tracking_method + ".yaml"),
+        tracker_config=tracker_cfg,
         reid_weights=Path(reid_name + '.pt'),
         device=device,
         half=False,
@@ -815,8 +884,8 @@ def process_sequence(seq_name: str,
         kept_frame_ids.append(fid)
         num_frames += 1
 
-        if dets.size and embs.size:
-            if dets.shape[0] != embs.shape[0]:
+        if dets.size and (motion_only or embs.size):
+            if (not motion_only) and dets.shape[0] != embs.shape[0]:
                 msg = (
                     f"Detection/embedding count mismatch for {seq_name} frame {fid}: "
                     f"dets={dets.shape[0]} embs={embs.shape[0]}"
@@ -826,7 +895,7 @@ def process_sequence(seq_name: str,
 
             # Time the tracker update (association only, embeddings pre-computed)
             t0 = time.perf_counter()
-            tracks = tracker.update(dets, img, embs)
+            tracks = tracker.update(dets, img, None if motion_only else embs)
             total_track_time_ms += (time.perf_counter() - t0) * 1000
             
             if tracks.size:
@@ -863,10 +932,15 @@ def run_generate_mot_results(opt: argparse.Namespace, evolve_config: dict = None
     exp_dir.mkdir(parents=True, exist_ok=True)
     opt.exp_dir = exp_dir
 
+    sequence_filter = _normalize_sequence_filter(getattr(opt, "sequence_filter", None))
+    motion_only = is_motion_only_tracker(opt.tracking_method)
+
     # Just collect sequence names by scanning directory names
     sequence_names = []
     for d in Path(opt.source).iterdir():
         if not d.is_dir():
+            continue
+        if not _sequence_matches_filter(d.name, sequence_filter):
             continue
         img_dir = d / "img1" if (d / "img1").exists() else d
         if any(img_dir.glob("*.jpg")) or any(img_dir.glob("*.png")):
@@ -882,9 +956,11 @@ def run_generate_mot_results(opt: argparse.Namespace, evolve_config: dict = None
             opt.yolo_model[0].stem,
             opt.reid_model[0].stem,
             opt.tracking_method,
+            str(opt.tracker_config) if getattr(opt, "tracker_config", None) else None,
             str(exp_dir),
             getattr(opt, 'fps', None),
             opt.device,
+            motion_only,
             evolve_config,
         )
         for seq in sequence_names
@@ -945,7 +1021,9 @@ def run_trackeval(opt: argparse.Namespace, verbose: bool = True) -> dict:
         opt (Namespace): Parsed command line arguments.
         verbose (bool): Whether to print results summary. Default True.
     """
-    seq_paths, seq_info = _collect_seq_info(opt.source)
+    seq_paths, seq_info = _collect_seq_info(
+        opt.source, sequence_filter=getattr(opt, "sequence_filter", None)
+    )
     annotations_dir = opt.source.parent / "annotations"
     gt_folder = annotations_dir if annotations_dir.exists() else opt.source
 
@@ -977,7 +1055,7 @@ def run_trackeval(opt: argparse.Namespace, verbose: bool = True) -> dict:
 
     # Load config to filter classes
     # Try to load config from benchmark name first, then fallback to source parent name
-    cfg_name = getattr(opt, 'benchmark', str(opt.source.parent.name))
+    cfg_name = getattr(opt, "dataset_config_name", None) or getattr(opt, 'benchmark', str(opt.source.parent.name))
     try:
         cfg = load_dataset_cfg(cfg_name)
     except FileNotFoundError:
@@ -1088,6 +1166,10 @@ def main(args):
     LOGGER.opt(colors=True).info(f"<bold>Detector:</bold>  <cyan>{args.yolo_model[0]}</cyan>")
     LOGGER.opt(colors=True).info(f"<bold>ReID:</bold>      <cyan>{args.reid_model[0]}</cyan>")
     LOGGER.opt(colors=True).info(f"<bold>Tracker:</bold>   <cyan>{args.tracking_method}</cyan>")
+    if getattr(args, "tracker_config", None):
+        LOGGER.opt(colors=True).info(f"<bold>Tracker cfg:</bold> <cyan>{args.tracker_config}</cyan>")
+    if getattr(args, "sequence_filter", None):
+        LOGGER.opt(colors=True).info(f"<bold>Sequences:</bold> <cyan>{args.sequence_filter}</cyan>")
     LOGGER.opt(colors=True).info(f"<bold>Benchmark:</bold> <cyan>{args.source}</cyan>")
     LOGGER.opt(colors=True).info(f"<bold>Image size:</bold> <cyan>{getattr(args, 'imgsz', None)}</cyan>")
     LOGGER.opt(colors=True).info("<blue>" + "="*60 + "</blue>")

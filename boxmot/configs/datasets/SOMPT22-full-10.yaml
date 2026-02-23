@@ -1,0 +1,13 @@
+# Full SOMPT22 dataset config (local path), evaluating only SOMPT22-10
+download:
+  runs_url: null
+  dataset_url: null
+
+benchmark:
+  source: "/home/zyw/code/boxmot_demo2/.venv/lib/python3.11/site-packages/trackeval/SOMPT22"
+  split: "train"
+  sequence_filter:
+    - "SOMPT22-10"
+  eval_classes:
+    1: pedestrian
+  distractor_classes: {}
