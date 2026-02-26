@@ -27,8 +27,11 @@ weights/*_openvino_model
 weights/*.engine
 weights/*.tflite
 
-# evaluation tools folder
-boxmot/engine/trackeval/
+# evaluation tools folder (directory or symlink)
+boxmot/engine/trackeval
+
+# local MOT17-04 experiment artifacts
+MOT17-04测试/
 
 # zip files
 *.zip
