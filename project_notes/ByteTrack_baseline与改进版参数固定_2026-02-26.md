@@ -1,4 +1,4 @@
-# ByteTrack baseline 与改进版参数固定 (2026-02-23)
+# ByteTrack baseline 与改进版参数固定 (2026-02-26)
 
 本文档用于把“baseline(原版) ByteTrack”与“改进版 ByteTrack”的参数固定下来，作为后续所有实验的唯一对齐基准。
 
@@ -16,6 +16,7 @@
 
 原版核心阈值 (对齐常见 ByteTrack 默认):
 
+- `min_conf = 0.1`
 - `track_buffer = 30`
 - `track_thresh = 0.5`
 - `new_track_thresh = 0.5`
@@ -40,10 +41,11 @@
 
 当前固定的 default 值 (后续实验不要再改动，除非开新版本号):
 
+- `min_conf = 0.1`
 - `track_buffer = 30`
-- `track_thresh = 0.6`
+- `track_thresh = 0.5`
 - `new_track_thresh = 0.65`
-- `match_thresh = 0.9`
+- `match_thresh = 0.8`
 
 entry/birth 相关:
 
@@ -76,24 +78,4 @@ adaptive zone 相关:
 - `adaptive_zone_margin = 50`
 - `adaptive_zone_padding = 1.2`
 - `adaptive_zone_min_box_area = 0`
-
-## 3. 使用方式 (建议统一)
-
-baseline:
-
-```bash
-uv run python -m boxmot.engine.cli eval \\
-  --tracking-method bytetrack \\
-  --tracker-config boxmot/configs/trackers/bytetrack_original.yaml \\
-  ...
-```
-
-improved:
-
-```bash
-uv run python -m boxmot.engine.cli eval \\
-  --tracking-method bytetrack \\
-  --tracker-config boxmot/configs/trackers/bytetrack_improved.yaml \\
-  ...
-```
 

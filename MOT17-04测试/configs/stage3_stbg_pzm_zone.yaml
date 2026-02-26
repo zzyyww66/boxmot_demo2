@@ -31,7 +31,7 @@ frame_rate:
 # Baseline config: disable new features
 entry_margin:
   type: qrandint
-  default: 50  # enable effective entry region margin (matches final tuned setup)
+  default: 50  # disabled
   range: [0, 101, 10]
 
 strict_entry_gate:
@@ -41,27 +41,27 @@ strict_entry_gate:
 
 birth_confirm_frames:
   type: qrandint
-  default: 2  # enabled two-hit confirmation
+  default: 2  # 1 disables confirmation gate
   range: [1, 4, 1]
 
 birth_suppress_iou:
   type: uniform
-  default: 0.7
+  default: 0.7  # <=0 disables duplicate suppression by IoU
   range: [0.0, 0.9]
 
 birth_suppress_center_dist:
   type: qrandint
-  default: 35
+  default: 35  # <=0 disables duplicate suppression by center distance
   range: [0, 101, 5]
 
 zombie_max_history:
   type: qrandint
-  default: 100
+  default: 100  # disabled
   range: [50, 201, 10]
 
 zombie_dist_thresh:
   type: qrandint
-  default: 150
+  default: 150  # effectively disabled
   range: [50, 301, 10]
 
 zombie_transition_frames:
@@ -81,13 +81,13 @@ zombie_match_max_dist:
 
 zombie_max_predict_frames:
   type: qrandint
-  default: 5
+  default: 5  # disabled
   range: [3, 11, 1]
 
 # Exit zone configuration
 exit_zone_enabled:
   type: choice
-  default: true
+  default: true  # default disabled
   options: [true, false]
 
 exit_zone_margin:
