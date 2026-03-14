@@ -498,3 +498,402 @@ def test_bytetrack_pending_birth_expires_without_consecutive_confirmation():
     tracker.update(det, img)
     assert len(tracker.pending_births) == 1
     assert len(tracker.active_tracks) == 0
+
+
+def test_bytetrack_spatial_prior_commits_stable_birth_and_support():
+    tracker = ByteTrack(
+        entry_margin=0,
+        strict_entry_gate=False,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_decay=1.0,
+        spatial_prior_birth_commit_age=3,
+        spatial_prior_birth_commit_hits=3,
+        spatial_prior_support_min_age=2,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    det = np.array([[220, 120, 280, 280, 0.95, 0]], dtype=np.float32)
+
+    tracker.update(np.empty((0, 6), dtype=np.float32), img)
+    tracker.update(det, img)
+    tracker.update(det, img)
+    tracker.update(det, img)
+
+    stats = tracker.spatial_prior.stats()
+    assert stats.support_total >= 1.9
+    assert stats.birth_total >= 0.9
+    assert tracker.active_tracks[0].spatial_birth_committed is True
+
+
+def test_bytetrack_spatial_prior_skips_first_frame_births():
+    tracker = ByteTrack(
+        entry_margin=0,
+        strict_entry_gate=False,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_decay=1.0,
+        spatial_prior_birth_commit_age=2,
+        spatial_prior_birth_commit_hits=2,
+        spatial_prior_support_min_age=2,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    dets = np.array(
+        [
+            [120, 120, 180, 260, 0.95, 0],
+            [260, 120, 320, 260, 0.95, 0],
+        ],
+        dtype=np.float32,
+    )
+
+    tracker.update(dets, img)
+    tracker.update(dets, img)
+    tracker.update(dets, img)
+
+    stats = tracker.spatial_prior.stats()
+    assert tracker.spatial_prior_birth_events == 0
+    assert stats.birth_total == 0.0
+    assert stats.support_total > 0.0
+
+
+def test_bytetrack_spatial_entry_region_uses_walkable_outer_band():
+    tracker = ByteTrack(
+        entry_margin=50,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_region_enabled=True,
+        spatial_prior_decay=1.0,
+        spatial_prior_grid_w=12,
+        spatial_prior_grid_h=8,
+        spatial_prior_region_conf=0.1,
+        spatial_prior_region_walk=0.1,
+        spatial_prior_region_birth=0.5,
+        spatial_prior_entry_band_radius=1,
+        spatial_prior_entry_support_threshold=1,
+        spatial_prior_entry_birth_threshold=1,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    tracker.update(np.empty((0, 6), dtype=np.float32), img)
+    tracker.spatial_prior.support_count.fill(0.0)
+    tracker.spatial_prior.birth_count.fill(0.0)
+    tracker.spatial_prior.support_count[1:7, 2:10] = 10.0
+    tracker.spatial_prior.birth_count[4, 5] = 12.0
+    tracker.spatial_prior.birth_count[1, 5] = 15.0
+    tracker.spatial_prior_support_samples = 100
+    tracker.spatial_prior_birth_events = 10
+
+    tracker._update_spatial_prior_stage()
+    tracker._refresh_spatial_region_masks()
+
+    def grid_point(ix: int, iy: int) -> np.ndarray:
+        x = ix / float(tracker.spatial_prior.grid_w - 1) * float(img.shape[1] - 1)
+        y = iy / float(tracker.spatial_prior.grid_h - 1) * float(img.shape[0] - 1)
+        return np.array([x, y], dtype=np.float32)
+
+    center_point = grid_point(5, 4)
+    edge_point = grid_point(5, 1)
+    assert tracker._get_spatial_region_label(center_point) == "core"
+    assert tracker._get_spatial_region_label(edge_point) == "entry"
+
+
+def test_bytetrack_spatial_entry_region_grows_along_connected_band():
+    tracker = ByteTrack(
+        entry_margin=50,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_region_enabled=True,
+        spatial_prior_decay=1.0,
+        spatial_prior_grid_w=12,
+        spatial_prior_grid_h=8,
+        spatial_prior_region_conf=0.1,
+        spatial_prior_region_walk=0.1,
+        spatial_prior_region_birth=0.8,
+        spatial_prior_region_birth_grow=0.3,
+        spatial_prior_region_grow_max_steps=0,
+        spatial_prior_region_component_mean_ratio=0.0,
+        spatial_prior_entry_band_radius=1,
+        spatial_prior_entry_support_threshold=1,
+        spatial_prior_entry_birth_threshold=1,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    tracker.update(np.empty((0, 6), dtype=np.float32), img)
+    tracker.spatial_prior.support_count.fill(0.0)
+    tracker.spatial_prior.birth_count.fill(0.0)
+    tracker.spatial_prior.support_count[1:7, 2:10] = 10.0
+    tracker.spatial_prior.birth_count[1, 4] = 2.0
+    tracker.spatial_prior.birth_count[1, 5] = 6.0
+    tracker.spatial_prior.birth_count[1, 6] = 2.0
+    tracker.spatial_prior.birth_count[6, 9] = 3.0
+    tracker.spatial_prior_support_samples = 100
+    tracker.spatial_prior_birth_events = 10
+
+    tracker._update_spatial_prior_stage()
+    tracker._refresh_spatial_region_masks()
+
+    def grid_point(ix: int, iy: int) -> np.ndarray:
+        x = ix / float(tracker.spatial_prior.grid_w - 1) * float(img.shape[1] - 1)
+        y = iy / float(tracker.spatial_prior.grid_h - 1) * float(img.shape[0] - 1)
+        return np.array([x, y], dtype=np.float32)
+
+    assert tracker._get_spatial_region_label(grid_point(4, 1)) == "entry"
+    assert tracker._get_spatial_region_label(grid_point(5, 1)) == "entry"
+    assert tracker._get_spatial_region_label(grid_point(6, 1)) == "entry"
+    assert tracker._get_spatial_region_label(grid_point(9, 6)) == "core"
+
+
+def test_bytetrack_spatial_entry_region_limits_long_tail_growth():
+    tracker = ByteTrack(
+        entry_margin=50,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_region_enabled=True,
+        spatial_prior_decay=1.0,
+        spatial_prior_grid_w=12,
+        spatial_prior_grid_h=8,
+        spatial_prior_region_conf=0.1,
+        spatial_prior_region_walk=0.1,
+        spatial_prior_region_birth=0.8,
+        spatial_prior_region_birth_grow=0.0,
+        spatial_prior_region_grow_max_steps=1,
+        spatial_prior_region_component_mean_ratio=0.0,
+        spatial_prior_entry_band_radius=1,
+        spatial_prior_entry_support_threshold=1,
+        spatial_prior_entry_birth_threshold=1,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    tracker.update(np.empty((0, 6), dtype=np.float32), img)
+    tracker.spatial_prior.support_count.fill(0.0)
+    tracker.spatial_prior.birth_count.fill(0.0)
+    tracker.spatial_prior.support_count[1:7, 2:10] = 10.0
+    tracker.spatial_prior.birth_count[1, 4] = 3.0
+    tracker.spatial_prior.birth_count[1, 5] = 7.0
+    tracker.spatial_prior.birth_count[1, 6] = 3.0
+    tracker.spatial_prior.birth_count[1, 7] = 1.2
+    tracker.spatial_prior.birth_count[1, 8] = 1.0
+    tracker.spatial_prior.birth_count[1, 9] = 1.0
+    tracker.spatial_prior_support_samples = 100
+    tracker.spatial_prior_birth_events = 10
+
+    tracker._update_spatial_prior_stage()
+    tracker._refresh_spatial_region_masks()
+
+    def grid_point(ix: int, iy: int) -> np.ndarray:
+        x = ix / float(tracker.spatial_prior.grid_w - 1) * float(img.shape[1] - 1)
+        y = iy / float(tracker.spatial_prior.grid_h - 1) * float(img.shape[0] - 1)
+        return np.array([x, y], dtype=np.float32)
+
+    assert tracker._get_spatial_region_label(grid_point(7, 1)) == "entry"
+    assert tracker._get_spatial_region_label(grid_point(8, 1)) == "core"
+    assert tracker._get_spatial_region_label(grid_point(9, 1)) == "core"
+
+
+def test_bytetrack_spatial_entry_region_allows_center_birth_override():
+    tracker = ByteTrack(
+        entry_margin=50,
+        strict_entry_gate=True,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_region_enabled=True,
+        spatial_prior_decay=1.0,
+        spatial_prior_region_conf=0.1,
+        spatial_prior_region_walk=0.0,
+        spatial_prior_region_birth=0.0,
+        spatial_prior_entry_band_radius=0,
+        spatial_prior_entry_support_threshold=1,
+        spatial_prior_entry_birth_threshold=1,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    empty = np.empty((0, 6), dtype=np.float32)
+    det = np.array([[220, 120, 280, 280, 0.95, 0]], dtype=np.float32)
+    point = np.array([250.0, 280.0], dtype=np.float32)
+
+    tracker.update(empty, img)
+    for _ in range(10):
+        tracker._spatial_prior_add_support(point)
+        tracker._spatial_prior_add_birth(point)
+    tracker._update_spatial_prior_stage()
+    tracker._refresh_spatial_region_masks()
+
+    tracker.update(det, img)
+    assert len(tracker.active_tracks) == 1
+
+
+def test_bytetrack_spatial_entry_region_blocks_center_birth_outside_hotspot():
+    tracker = ByteTrack(
+        entry_margin=50,
+        strict_entry_gate=True,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_region_enabled=True,
+        spatial_prior_decay=1.0,
+        spatial_prior_region_conf=0.1,
+        spatial_prior_region_walk=0.0,
+        spatial_prior_region_birth=0.0,
+        spatial_prior_entry_band_radius=0,
+        spatial_prior_entry_support_threshold=1,
+        spatial_prior_entry_birth_threshold=1,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    empty = np.empty((0, 6), dtype=np.float32)
+    det = np.array([[220, 120, 280, 280, 0.95, 0]], dtype=np.float32)
+    point = np.array([250.0, 280.0], dtype=np.float32)
+    birth_point = np.array([20.0, 280.0], dtype=np.float32)
+
+    tracker.update(empty, img)
+    for _ in range(10):
+        tracker._spatial_prior_add_support(point)
+    for _ in range(10):
+        tracker._spatial_prior_add_support(birth_point)
+        tracker._spatial_prior_add_birth(birth_point)
+    tracker._update_spatial_prior_stage()
+    tracker._refresh_spatial_region_masks()
+
+    tracker.update(det, img)
+    assert len(tracker.active_tracks) == 0
+
+
+def test_bytetrack_spatial_region_masks_create_center_entry_zone():
+    tracker = ByteTrack(
+        entry_margin=50,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_region_enabled=True,
+        spatial_prior_decay=1.0,
+        spatial_prior_region_conf=0.1,
+        spatial_prior_region_walk=0.0,
+        spatial_prior_entry_band_radius=0,
+        spatial_prior_entry_support_threshold=1,
+        spatial_prior_entry_birth_threshold=1,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    point = np.array([320.0, 320.0], dtype=np.float32)
+
+    tracker.update(np.empty((0, 6), dtype=np.float32), img)
+    for _ in range(10):
+        tracker._spatial_prior_add_support(point)
+        tracker._spatial_prior_add_birth(point)
+    tracker._update_spatial_prior_stage()
+    tracker._refresh_spatial_region_masks()
+
+    assert tracker._get_spatial_region_label(point) == "entry"
+    assert tracker._is_in_entry_zone(np.array([290, 240, 60, 80], dtype=np.float32), img.shape[:2]) is True
+
+
+def test_bytetrack_spatial_region_core_is_not_entry():
+    tracker = ByteTrack(
+        entry_margin=50,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_region_enabled=True,
+        spatial_prior_decay=1.0,
+        spatial_prior_region_conf=0.1,
+        spatial_prior_region_walk=0.0,
+        spatial_prior_entry_band_radius=0,
+        spatial_prior_entry_support_threshold=1,
+        spatial_prior_entry_birth_threshold=1,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    point = np.array([320.0, 320.0], dtype=np.float32)
+    other_point = np.array([80.0, 320.0], dtype=np.float32)
+
+    tracker.update(np.empty((0, 6), dtype=np.float32), img)
+    for _ in range(10):
+        tracker._spatial_prior_add_support(point)
+    tracker._spatial_prior_add_support(other_point)
+    tracker._spatial_prior_add_birth(other_point)
+    tracker._update_spatial_prior_stage()
+    tracker._refresh_spatial_region_masks()
+
+    assert tracker._get_spatial_region_label(point) == "core"
+    assert tracker._is_in_entry_zone(np.array([290, 240, 60, 80], dtype=np.float32), img.shape[:2]) is False
+
+
+def test_bytetrack_spatial_prior_stage_uses_entry_thresholds_only():
+    tracker = ByteTrack(
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_region_enabled=True,
+        spatial_prior_entry_support_threshold=3,
+        spatial_prior_entry_birth_threshold=2,
+    )
+
+    assert tracker.spatial_prior_stage == "learn_only"
+    tracker.spatial_prior_support_samples = 3
+    tracker.spatial_prior_birth_events = 1
+    tracker._update_spatial_prior_stage()
+    assert tracker.spatial_prior_stage == "learn_only"
+
+    tracker.spatial_prior_birth_events = 2
+    tracker._update_spatial_prior_stage()
+    assert tracker.spatial_prior_stage == "entry_only"
+
+
+def test_bytetrack_exit_zone_stays_geometric_when_entry_region_is_enabled():
+    tracker = ByteTrack(
+        entry_margin=50,
+        exit_zone_enabled=True,
+        exit_zone_margin=40,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_region_enabled=True,
+        spatial_prior_entry_support_threshold=1,
+        spatial_prior_entry_birth_threshold=1,
+        spatial_prior_region_conf=0.1,
+        spatial_prior_region_walk=0.0,
+        spatial_prior_region_birth=0.0,
+        spatial_prior_entry_band_radius=0,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    center_point = np.array([320.0, 320.0], dtype=np.float32)
+
+    tracker.update(np.empty((0, 6), dtype=np.float32), img)
+    for _ in range(10):
+        tracker._spatial_prior_add_support(center_point)
+        tracker._spatial_prior_add_birth(center_point)
+    tracker._update_spatial_prior_stage()
+    tracker._refresh_spatial_region_masks()
+
+    assert tracker._get_spatial_region_label(center_point) == "entry"
+    assert tracker._is_in_exit_zone(np.array([290, 240, 60, 80], dtype=np.float32), img.shape[:2]) is False
+    assert tracker._is_in_exit_zone(np.array([10, 240, 60, 80], dtype=np.float32), img.shape[:2]) is True
+
+
+def test_bytetrack_spatial_regions_fallback_to_rectangle_before_entry_stage():
+    tracker = ByteTrack(
+        entry_margin=50,
+        strict_entry_gate=True,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_region_enabled=True,
+        spatial_prior_entry_support_threshold=2,
+        spatial_prior_entry_birth_threshold=2,
+        spatial_prior_region_conf=0.1,
+        spatial_prior_region_walk=0.0,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    center_det = np.array([[290, 240, 350, 320, 0.95, 0]], dtype=np.float32)
+    empty = np.empty((0, 6), dtype=np.float32)
+
+    tracker.update(empty, img)
+    tracker._spatial_prior_add_support(np.array([320.0, 320.0], dtype=np.float32))
+    tracker._spatial_prior_add_birth(np.array([320.0, 320.0], dtype=np.float32))
+    tracker._update_spatial_prior_stage()
+    tracker._refresh_spatial_region_masks()
+
+    tracker.update(center_det, img)
+    assert len(tracker.active_tracks) == 0
+    assert tracker._spatial_region_ready() is False

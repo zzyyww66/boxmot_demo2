@@ -135,3 +135,99 @@ adaptive_zone_min_box_area:
   type: qrandint
   default: 0
   range: [0, 5001, 100]
+
+# Passive spatial prior learning
+spatial_prior_enabled:
+  type: choice
+  default: false
+  options: [true, false]
+
+spatial_prior_grid_w:
+  type: qrandint
+  default: 48
+  range: [16, 97, 8]
+
+spatial_prior_grid_h:
+  type: qrandint
+  default: 27
+  range: [9, 65, 6]
+
+spatial_prior_sigma:
+  type: uniform
+  default: 1.5
+  range: [0.5, 3.5]
+
+spatial_prior_decay:
+  type: uniform
+  default: 0.999
+  range: [0.95, 1.0]
+
+spatial_prior_birth_commit_age:
+  type: qrandint
+  default: 3
+  range: [1, 11, 1]
+
+spatial_prior_birth_commit_hits:
+  type: qrandint
+  default: 3
+  range: [1, 11, 1]
+
+spatial_prior_support_min_age:
+  type: qrandint
+  default: 2
+  range: [1, 11, 1]
+
+spatial_prior_region_enabled:
+  type: choice
+  default: false
+  options: [true, false]
+
+spatial_prior_region_conf:
+  type: uniform
+  default: 1.0
+  range: [0.1, 10.0]
+
+spatial_prior_region_walk:
+  type: uniform
+  default: 0.05
+  range: [0.0, 1.0]
+
+spatial_prior_region_birth:
+  type: uniform
+  default: 0.85
+  range: [0.05, 1.0]
+
+spatial_prior_region_birth_grow:
+  type: uniform
+  default: 0.6
+  range: [0.0, 1.0]
+
+spatial_prior_region_grow_max_steps:
+  type: qrandint
+  default: 3
+  range: [0, 9, 1]
+
+spatial_prior_region_component_mean_ratio:
+  type: uniform
+  default: 0.45
+  range: [0.0, 1.0]
+
+spatial_prior_region_component_max_area:
+  type: qrandint
+  default: 0
+  range: [0, 257, 8]
+
+spatial_prior_entry_band_radius:
+  type: qrandint
+  default: 2
+  range: [0, 7, 1]
+
+spatial_prior_entry_support_threshold:
+  type: qrandint
+  default: 100
+  range: [20, 401, 20]
+
+spatial_prior_entry_birth_threshold:
+  type: qrandint
+  default: 8
+  range: [2, 31, 1]

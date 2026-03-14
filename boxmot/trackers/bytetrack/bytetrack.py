@@ -7,6 +7,7 @@ import numpy as np
 from boxmot.motion.kalman_filters.aabb.xyah_kf import KalmanFilterXYAH
 from boxmot.trackers.basetracker import BaseTracker
 from boxmot.trackers.bytetrack.basetrack import BaseTrack, TrackState
+from boxmot.trackers.bytetrack.spatial_prior import SpatialPriorField
 from boxmot.utils.matching import fuse_score, iou_distance, linear_assignment
 from boxmot.utils.ops import tlwh2xyah, xywh2tlwh, xywh2xyxy, xyxy2xywh
 
@@ -28,6 +29,9 @@ class STrack(BaseTrack):
         self.is_activated = False
         self.tracklet_len = 0
         self.history_observations = deque([], maxlen=self.max_obs)
+        self.spatial_birth_frame = -1
+        self.spatial_birth_point = None
+        self.spatial_birth_committed = False
 
     def predict(self):
         mean_state = self.mean.copy()
@@ -268,11 +272,283 @@ class ByteTrack(BaseTracker):
         self._outside_zone_det_inds = set()  # Detection indices that were outside effective zone before expansion
         self._effective_zone_last_frame = -1
 
+        # Passive spatial prior learning for fixed-camera scenes.
+        self.spatial_prior_enabled = kwargs.get('spatial_prior_enabled', False)
+        self.spatial_prior_grid_w = kwargs.get('spatial_prior_grid_w', 48)
+        self.spatial_prior_grid_h = kwargs.get('spatial_prior_grid_h', 27)
+        self.spatial_prior_sigma = kwargs.get('spatial_prior_sigma', 1.5)
+        self.spatial_prior_decay = kwargs.get('spatial_prior_decay', 1.0)
+        self.spatial_prior_birth_commit_age = max(1, int(kwargs.get('spatial_prior_birth_commit_age', 3)))
+        self.spatial_prior_birth_commit_hits = max(1, int(kwargs.get('spatial_prior_birth_commit_hits', 3)))
+        self.spatial_prior_support_min_age = max(1, int(kwargs.get('spatial_prior_support_min_age', 2)))
+        self.spatial_prior_region_enabled = kwargs.get('spatial_prior_region_enabled', False)
+        self.spatial_prior_region_conf = float(kwargs.get('spatial_prior_region_conf', 1.0))
+        self.spatial_prior_region_walk = float(kwargs.get('spatial_prior_region_walk', 0.05))
+        # Interpreted as the birth-density quantile used to carve out entry hotspots.
+        self.spatial_prior_region_birth = float(kwargs.get('spatial_prior_region_birth', 0.85))
+        self.spatial_prior_region_birth_grow = float(kwargs.get('spatial_prior_region_birth_grow', 0.6))
+        self.spatial_prior_region_grow_max_steps = max(0, int(kwargs.get('spatial_prior_region_grow_max_steps', 3)))
+        self.spatial_prior_region_component_mean_ratio = float(
+            kwargs.get('spatial_prior_region_component_mean_ratio', 0.45)
+        )
+        self.spatial_prior_region_component_max_area = max(
+            0, int(kwargs.get('spatial_prior_region_component_max_area', 0))
+        )
+        self.spatial_prior_entry_band_radius = max(0, int(kwargs.get('spatial_prior_entry_band_radius', 2)))
+        self.spatial_prior_entry_support_threshold = int(kwargs.get('spatial_prior_entry_support_threshold', 100))
+        self.spatial_prior_entry_birth_threshold = int(kwargs.get('spatial_prior_entry_birth_threshold', 8))
+        self.spatial_prior = (
+            SpatialPriorField(
+                grid_w=self.spatial_prior_grid_w,
+                grid_h=self.spatial_prior_grid_h,
+                sigma=self.spatial_prior_sigma,
+                decay=self.spatial_prior_decay,
+            )
+            if self.spatial_prior_enabled
+            else None
+        )
+        self.spatial_entry_mask = None
+        self.spatial_core_mask = None
+        self.spatial_prior_support_samples = 0
+        self.spatial_prior_birth_events = 0
+        self.spatial_prior_stage = "learn_only"
         self.active_tracks = []  # type: list[STrack]
         self.lost_stracks = []  # type: list[STrack]
         self.zombie_stracks = []  # type: list[STrack]
         self.pending_births = []  # type: list[dict]
         self.removed_stracks = []  # type: list[STrack]
+
+    def _spatial_prior_active(self) -> bool:
+        """Return whether the passive spatial-prior learner is enabled."""
+        return self.spatial_prior is not None
+
+    @staticmethod
+    def _footpoint_from_xyxy(xyxy: np.ndarray) -> np.ndarray:
+        """Convert an xyxy box into a bottom-center footpoint."""
+        return np.array(
+            [
+                (float(xyxy[0]) + float(xyxy[2])) * 0.5,
+                float(xyxy[3]),
+            ],
+            dtype=np.float32,
+        )
+
+    def _register_spatial_birth(self, track: STrack) -> None:
+        """Attach provisional birth metadata to a newly activated track."""
+        if not self._spatial_prior_active():
+            return
+        track.spatial_birth_frame = self.frame_count
+        if self.frame_count <= 1:
+            track.spatial_birth_point = None
+            track.spatial_birth_committed = True
+            return
+        track.spatial_birth_point = self._footpoint_from_xyxy(track.xyxy)
+        track.spatial_birth_committed = False
+
+    def _update_spatial_prior_tracks(self) -> None:
+        """Update support counts and commit stabilized birth events."""
+        if not self._spatial_prior_active():
+            return
+        for track in self.active_tracks:
+            if not track.is_activated or track.state != TrackState.Tracked:
+                continue
+            age = max(1, self.frame_count - track.start_frame + 1)
+            if age >= self.spatial_prior_support_min_age:
+                self._spatial_prior_add_support(self._footpoint_from_xyxy(track.xyxy))
+            if track.spatial_birth_committed:
+                continue
+            hits = track.tracklet_len + 1
+            if age >= self.spatial_prior_birth_commit_age or hits >= self.spatial_prior_birth_commit_hits:
+                if track.spatial_birth_point is not None:
+                    self._spatial_prior_add_birth(track.spatial_birth_point)
+                track.spatial_birth_committed = True
+
+    def _spatial_prior_add_support(self, point: np.ndarray) -> None:
+        """Add one support sample to the field and maturity counters."""
+        if not self._spatial_prior_active():
+            return
+        self.spatial_prior.add_support(point)
+        self.spatial_prior_support_samples += 1
+
+    def _spatial_prior_add_birth(self, point: np.ndarray) -> None:
+        """Add one confirmed birth event to the field and maturity counters."""
+        if not self._spatial_prior_active():
+            return
+        self.spatial_prior.add_birth(point)
+        self.spatial_prior_birth_events += 1
+
+    def _update_spatial_prior_stage(self) -> None:
+        """Advance the spatial-prior maturity stage using hard thresholds."""
+        if not self._spatial_prior_active():
+            self.spatial_prior_stage = "learn_only"
+            return
+        if (
+            self.spatial_prior_support_samples >= self.spatial_prior_entry_support_threshold
+            and self.spatial_prior_birth_events >= self.spatial_prior_entry_birth_threshold
+        ):
+            self.spatial_prior_stage = "entry_only"
+
+    def _spatial_region_ready(self) -> bool:
+        """Return whether the explicit probability-field entry/core masks are ready."""
+        if not (self._spatial_prior_active() and self.spatial_prior_region_enabled):
+            return False
+        return self.spatial_prior_stage == "entry_only"
+
+    def _erode_spatial_mask(self, mask: np.ndarray, radius: int) -> np.ndarray:
+        """Erode a boolean mask with a 3x3 neighborhood on the prior grid."""
+        radius = max(0, int(radius))
+        eroded = mask.astype(bool).copy()
+        if radius <= 0 or not np.any(eroded):
+            return eroded
+        h, w = eroded.shape
+        for _ in range(radius):
+            padded = np.pad(eroded, 1, mode="constant", constant_values=False)
+            next_mask = np.ones((h, w), dtype=bool)
+            for dy in range(3):
+                for dx in range(3):
+                    next_mask &= padded[dy : dy + h, dx : dx + w]
+            eroded = next_mask
+            if not np.any(eroded):
+                break
+        return eroded
+
+    def _grow_spatial_region(
+        self, seed: np.ndarray, candidate: np.ndarray, max_steps: int | None = None
+    ) -> np.ndarray:
+        """Keep candidate cells that are 8-neighbor connected to a seed cell."""
+        region = seed.astype(bool).copy()
+        candidate = candidate.astype(bool)
+        if not np.any(region):
+            return region
+        h, w = region.shape
+        steps = 0
+        while True:
+            if max_steps is not None and steps >= max_steps:
+                return region
+            padded = np.pad(region, 1, mode="constant", constant_values=False)
+            expanded = np.zeros((h, w), dtype=bool)
+            for dy in range(3):
+                for dx in range(3):
+                    expanded |= padded[dy : dy + h, dx : dx + w]
+            next_region = candidate & expanded
+            if np.array_equal(next_region, region):
+                return region
+            region = next_region
+            steps += 1
+
+    def _iter_spatial_components(self, mask: np.ndarray) -> list[list[tuple[int, int]]]:
+        """Return 8-neighbor connected components from a boolean mask."""
+        mask = mask.astype(bool)
+        if not np.any(mask):
+            return []
+
+        h, w = mask.shape
+        visited = np.zeros_like(mask, dtype=bool)
+        components: list[list[tuple[int, int]]] = []
+        for iy in range(h):
+            for ix in range(w):
+                if not mask[iy, ix] or visited[iy, ix]:
+                    continue
+                queue: deque[tuple[int, int]] = deque([(iy, ix)])
+                visited[iy, ix] = True
+                coords: list[tuple[int, int]] = []
+                while queue:
+                    cy, cx = queue.popleft()
+                    coords.append((cy, cx))
+                    for ny in range(max(0, cy - 1), min(h, cy + 2)):
+                        for nx in range(max(0, cx - 1), min(w, cx + 2)):
+                            if not mask[ny, nx] or visited[ny, nx]:
+                                continue
+                            visited[ny, nx] = True
+                            queue.append((ny, nx))
+                components.append(coords)
+        return components
+
+    def _select_spatial_entry_components(
+        self,
+        seed: np.ndarray,
+        candidate: np.ndarray,
+        birth_density: np.ndarray,
+    ) -> np.ndarray:
+        """Filter candidate components so weak bridges do not swallow the whole outer band."""
+        seed = seed.astype(bool)
+        candidate = candidate.astype(bool)
+        region = np.zeros_like(candidate, dtype=bool)
+        if not np.any(seed):
+            return region
+
+        for coords in self._iter_spatial_components(candidate):
+            component = np.zeros_like(candidate, dtype=bool)
+            ys, xs = zip(*coords)
+            component[np.asarray(ys), np.asarray(xs)] = True
+            seed_component = component & seed
+            if not np.any(seed_component):
+                continue
+
+            area = len(coords)
+            if self.spatial_prior_region_component_max_area > 0 and area > self.spatial_prior_region_component_max_area:
+                continue
+
+            seed_values = birth_density[seed_component]
+            component_values = birth_density[component]
+            seed_mean = float(seed_values.mean()) if seed_values.size else 0.0
+            component_mean = float(component_values.mean()) if component_values.size else 0.0
+            mean_ratio = max(0.0, self.spatial_prior_region_component_mean_ratio)
+            if seed_mean > 0.0 and component_mean < seed_mean * mean_ratio:
+                continue
+
+            max_steps = self.spatial_prior_region_grow_max_steps
+            grown = self._grow_spatial_region(
+                seed_component,
+                component,
+                max_steps=None if max_steps <= 0 else max_steps,
+            )
+            region |= grown
+        return region
+
+    def _refresh_spatial_region_masks(self) -> None:
+        """Build entry/core masks from the learned probability field."""
+        if not self._spatial_region_ready():
+            self.spatial_entry_mask = None
+            self.spatial_core_mask = None
+            return
+
+        prob_maps = self.spatial_prior.get_probability_maps()
+        metric_maps = self.spatial_prior.get_metric_maps()
+        confident = prob_maps["confidence"] >= self.spatial_prior_region_conf
+        walkable = prob_maps["walkable"] >= self.spatial_prior_region_walk
+        eligible = confident & walkable
+        if self.spatial_prior_entry_band_radius <= 0:
+            entry_band = eligible
+        else:
+            core_seed = self._erode_spatial_mask(eligible, self.spatial_prior_entry_band_radius)
+            entry_band = eligible & ~core_seed
+        birth_density = metric_maps["birth_density"]
+        positive_birth = entry_band & (birth_density > 0.0)
+        entry = np.zeros_like(eligible, dtype=bool)
+        if np.any(positive_birth):
+            high_quantile = float(np.clip(self.spatial_prior_region_birth, 0.0, 1.0))
+            low_quantile = float(np.clip(self.spatial_prior_region_birth_grow, 0.0, high_quantile))
+            values = birth_density[positive_birth]
+            high_threshold = float(np.quantile(values, high_quantile))
+            low_threshold = float(np.quantile(values, low_quantile))
+            seed = positive_birth & (birth_density >= high_threshold)
+            candidate = positive_birth & (birth_density >= low_threshold)
+            entry = self._select_spatial_entry_components(seed, candidate, birth_density)
+        core = eligible & ~entry
+        self.spatial_entry_mask = entry
+        self.spatial_core_mask = core
+
+    def _get_spatial_region_label(self, point: np.ndarray) -> str | None:
+        """Return the explicit spatial region label for a point, if masks are ready."""
+        if self.spatial_entry_mask is None or self.spatial_core_mask is None:
+            return None
+        ix, iy = self.spatial_prior.point_to_index(point)
+        if self.spatial_entry_mask[iy, ix]:
+            return "entry"
+        if self.spatial_core_mask[iy, ix]:
+            return "core"
+        return None
 
     def _zombie_enabled(self) -> bool:
         """Return whether zombie rescue/history should be active."""
@@ -299,14 +575,19 @@ class ByteTrack(BaseTracker):
         if margin is None:
             margin = self.entry_margin
 
+        # Prefer explicit probability-field regions when they are available.
+        x1, y1, w, h = tlwh
+        x2, y2 = x1 + w, y1 + h
+        point = np.array([(x1 + x2) * 0.5, y2], dtype=np.float32)
+        region_label = self._get_spatial_region_label(point)
+        if region_label is not None:
+            return region_label == "entry"
+
         # If entry_margin is 0, consider everything as entry zone (disabled gating)
         if margin <= 0:
             return True
 
         img_h, img_w = img_shape[0], img_shape[1]
-        # tlwh format in this codebase: [left(x), top(y), width, height]
-        x1, y1, w, h = tlwh
-        x2, y2 = x1 + w, y1 + h
 
         # Fixed margin mode (original behavior)
         if not self.adaptive_zone_enabled or self._effective_zone is None:
@@ -340,12 +621,12 @@ class ByteTrack(BaseTracker):
         A non-positive margin disables exit-zone triggering.
         """
         margin = self.exit_zone_margin
+        x1, y1, w, h = tlwh
+        x2, y2 = x1 + w, y1 + h
         if margin <= 0:
             return False
 
         img_h, img_w = img_shape[0], img_shape[1]
-        x1, y1, w, h = tlwh
-        x2, y2 = x1 + w, y1 + h
         return bool(
             x1 < margin
             or y1 < margin
@@ -678,6 +959,7 @@ class ByteTrack(BaseTracker):
             if self._is_birth_suppressed(det_track, reference_tracks):
                 return False
             det_track.activate(self.kalman_filter, self.frame_count)
+            self._register_spatial_birth(det_track)
             self._set_exit_pending(det_track, False)
             activated_starcks.append(det_track)
             return True
@@ -699,6 +981,7 @@ class ByteTrack(BaseTracker):
         hits = pending["hits"] + 1
         if hits >= self.birth_confirm_frames:
             det_track.activate(self.kalman_filter, self.frame_count)
+            self._register_spatial_birth(det_track)
             self._set_exit_pending(det_track, False)
             activated_starcks.append(det_track)
             return True
@@ -727,6 +1010,17 @@ class ByteTrack(BaseTracker):
             self.img_h, self.img_w = img.shape[:2]
         elif hasattr(self, 'h') and hasattr(self, 'w'):
             self.img_h, self.img_w = self.h, self.w
+        if self._spatial_prior_active() and hasattr(self, 'img_h') and hasattr(self, 'img_w'):
+            self.spatial_prior.configure_image(self.img_w, self.img_h)
+            self.spatial_prior.step()
+            if self._spatial_region_ready() or self.spatial_entry_mask is not None or self.spatial_core_mask is not None:
+                self._refresh_spatial_region_masks()
+        if img is not None:
+            current_img_shape = img.shape[:2]
+        elif hasattr(self, 'h') and hasattr(self, 'w'):
+            current_img_shape = (self.h, self.w)
+        else:
+            current_img_shape = (1080, 1920)
 
         activated_starcks = []
         refind_stracks = []
@@ -821,13 +1115,6 @@ class ByteTrack(BaseTracker):
                 # Check exit zone: mark exit-pending for delayed removal after grace frames
                 if self.exit_zone_enabled:
                     track_tlwh = track.tlwh
-                    if img is not None:
-                        current_img_shape = img.shape[:2]
-                    elif hasattr(self, 'h') and hasattr(self, 'w'):
-                        current_img_shape = (self.h, self.w)
-                    else:
-                        current_img_shape = (1080, 1920)
-
                     in_exit_zone = self._is_in_exit_zone(track_tlwh, current_img_shape)
                     if in_exit_zone:
                         self._set_exit_pending(track, True)
@@ -861,13 +1148,6 @@ class ByteTrack(BaseTracker):
         # Zombie tracks = tracks that have been lost for > 30 frames
         # These tracks would normally be discarded by original ByteTrack
         # Get image dimensions
-        if img is not None:
-            current_img_shape = img.shape[:2]
-        elif hasattr(self, 'h') and hasattr(self, 'w'):
-            current_img_shape = (self.h, self.w)
-        else:
-            current_img_shape = (1080, 1920)
-
         # Track which zombies were rescued
         rescued_zombies = []
 
@@ -878,6 +1158,7 @@ class ByteTrack(BaseTracker):
                 if det_track.conf < self.new_track_thresh:
                     continue
                 det_track.activate(self.kalman_filter, self.frame_count)
+                self._register_spatial_birth(det_track)
                 activated_starcks.append(det_track)
         else:
             # Normal frames: process unmatched detections
@@ -914,7 +1195,6 @@ class ByteTrack(BaseTracker):
 
                 det_tlwh = det_track.tlwh
                 is_entry = self._is_in_entry_zone(det_tlwh, current_img_shape)
-
                 if is_entry:
                     # In entry zone -> create new ID (original behavior)
                     birth_refs = self._collect_birth_reference_tracks(
@@ -970,7 +1250,7 @@ class ByteTrack(BaseTracker):
         new_lost_stracks = []
         for track in self.lost_stracks:
             frames_lost = self.frame_count - track.lost_frame_id
-            if self.exit_zone_enabled and bool(getattr(track, 'exit_pending', False)):
+            if bool(getattr(track, 'exit_pending', False)):
                 grace = max(1, int(self.exit_zone_remove_grace))
                 if frames_lost >= grace:
                     track.mark_removed()
@@ -1038,6 +1318,8 @@ class ByteTrack(BaseTracker):
         self.active_tracks, self.lost_stracks = remove_duplicate_stracks(
             self.active_tracks, self.lost_stracks
         )
+        self._update_spatial_prior_tracks()
+        self._update_spatial_prior_stage()
         # get confs of lost tracks
         output_stracks = [track for track in self.active_tracks if track.is_activated]
         outputs = []
