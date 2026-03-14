@@ -98,6 +98,8 @@ def core_options(func):
                      help='show or hide detection labels'),
         click.option('--show-conf/--hide-conf', default=True,
                      help='show or hide detection confidences'),
+        click.option('--show-class/--hide-class', default=True,
+                     help='show or hide class ids in labels'),
         click.option('--show-trajectories', is_flag=True,
                      help='overlay past trajectories'),
         click.option('--show-lost', is_flag=True,

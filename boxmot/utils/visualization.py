@@ -11,6 +11,20 @@ class BaseVisualization(ABC):
     Abstract base class for visualization methods in BaseTracker.
     """
     
+    def _format_label(self, conf: float, cls: int, id: int, angle: float | None = None) -> str:
+        """Build track label text according to tracker display flags."""
+        if not getattr(self, "show_labels", True):
+            return ""
+
+        label_parts = [f"id: {int(id)}"]
+        if getattr(self, "show_conf", True):
+            label_parts.append(f"conf: {conf:.2f}")
+        if getattr(self, "show_class", True):
+            label_parts.append(f"c: {int(cls)}")
+        if angle is not None:
+            label_parts.append(f"a: {angle:.2f}")
+        return ", ".join(label_parts)
+
     def id_to_color(
         self,
         id: int,
@@ -80,15 +94,17 @@ class BaseVisualization(ABC):
                 thickness=thickness,
             )
 
-            img = cv.putText(
-                img,
-                f"id: {int(id)}, conf: {conf:.2f}, c: {int(cls)}, a: {box[4]:.2f}",
-                (int(box[0]), int(box[1]) - 10),
-                cv.FONT_HERSHEY_SIMPLEX,
-                fontscale,
-                color,
-                thickness,
-            )
+            label = self._format_label(conf=conf, cls=cls, id=id, angle=box[4])
+            if label:
+                img = cv.putText(
+                    img,
+                    label,
+                    (int(box[0]), int(box[1]) - 10),
+                    cv.FONT_HERSHEY_SIMPLEX,
+                    fontscale,
+                    color,
+                    thickness,
+                )
         else:
             x1, y1, x2, y2 = map(int, (box[0], box[1], box[2], box[3]))
             if style == "dashed":
@@ -101,15 +117,17 @@ class BaseVisualization(ABC):
                     color,
                     thickness,
                 )
-            img = cv.putText(
-                img,
-                f"id: {int(id)}, conf: {conf:.2f}, c: {int(cls)}",
-                (x1, max(0, y1 - 10)),
-                cv.FONT_HERSHEY_SIMPLEX,
-                fontscale,
-                color,
-                thickness,
-            )
+            label = self._format_label(conf=conf, cls=cls, id=id)
+            if label:
+                img = cv.putText(
+                    img,
+                    label,
+                    (x1, max(0, y1 - 10)),
+                    cv.FONT_HERSHEY_SIMPLEX,
+                    fontscale,
+                    color,
+                    thickness,
+                )
         return img
 
     def plot_trackers_trajectories(

@@ -74,6 +74,9 @@ def on_predict_start(predictor, args, timing_stats=None):
         # set target_id if user passed it
         if args.target_id is not None:
             tracker.target_id = args.target_id
+        tracker.show_labels = args.show_labels
+        tracker.show_conf = args.show_conf
+        tracker.show_class = getattr(args, "show_class", True)
         
         # Wrap ReID model for timing instrumentation
         if timing_stats is not None:
