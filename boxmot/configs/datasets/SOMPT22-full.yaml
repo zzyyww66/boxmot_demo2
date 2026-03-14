@@ -4,7 +4,7 @@ download:
   dataset_url: null
 
 benchmark:
-  source: "/home/zyw/code/boxmot_demo2/.venv/lib/python3.11/site-packages/trackeval/SOMPT22"
+  source: "/home/zyw/code/boxmot_demo2/sompt22"
   split: "train"
   eval_classes:
     1: pedestrian

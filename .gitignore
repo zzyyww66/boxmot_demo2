@@ -68,3 +68,6 @@ boxmot/motion/cmc/*.jpg
 
 # local sqlite scratch files
 *.db
+*.Zone.Identifier
+*:Zone.Identifier
+sompt22/
