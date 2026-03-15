@@ -953,9 +953,15 @@ class ByteTrack(BaseTracker):
 
         return best_idx
 
-    def _try_activate_new_track(self, det_track, activated_starcks, reference_tracks):
-        """Apply duplicate suppression and temporal confirmation before spawning a new ID."""
-        if self.birth_confirm_frames <= 1:
+    def _try_activate_new_track(
+        self,
+        det_track,
+        activated_starcks,
+        reference_tracks,
+        skip_confirmation: bool = False,
+    ):
+        """Apply duplicate suppression and optional temporal confirmation before spawning a new ID."""
+        if skip_confirmation or self.birth_confirm_frames <= 1:
             if self._is_birth_suppressed(det_track, reference_tracks):
                 return False
             det_track.activate(self.kalman_filter, self.frame_count)
@@ -1196,7 +1202,9 @@ class ByteTrack(BaseTracker):
                 det_tlwh = det_track.tlwh
                 is_entry = self._is_in_entry_zone(det_tlwh, current_img_shape)
                 if is_entry:
-                    # In entry zone -> create new ID (original behavior)
+                    # Entry-zone births use original ByteTrack activation semantics:
+                    # activate immediately, then let the usual unconfirmed stage decide
+                    # whether the track stabilizes on the next frame.
                     birth_refs = self._collect_birth_reference_tracks(
                         self.active_tracks,
                         self.lost_stracks,
@@ -1205,7 +1213,12 @@ class ByteTrack(BaseTracker):
                         refind_stracks,
                         lost_stracks,
                     )
-                    self._try_activate_new_track(det_track, activated_starcks, birth_refs)
+                    self._try_activate_new_track(
+                        det_track,
+                        activated_starcks,
+                        birth_refs,
+                        skip_confirmation=True,
+                    )
                 else:
                     # In center zone -> try match with zombie tracks
                     # Zombie tracks are those lost for > 30 frames

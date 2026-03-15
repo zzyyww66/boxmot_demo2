@@ -356,6 +356,29 @@ def test_bytetrack_outside_before_expand_keeps_new_id_creation():
     assert id3 != id1
 
 
+def test_bytetrack_entry_zone_birth_skips_pending_confirmation():
+    tracker = ByteTrack(
+        new_track_thresh=0.6,
+        birth_confirm_frames=2,
+        entry_margin=50,
+        strict_entry_gate=False,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    empty = np.empty((0, 6), dtype=np.float32)
+    det = np.array([[5, 120, 65, 260, 0.9, 0]], dtype=np.float32)
+
+    tracker.update(empty, img)
+    out2 = tracker.update(det, img)
+    assert out2.shape[0] == 0
+    assert len(tracker.pending_births) == 0
+    assert len(tracker.active_tracks) == 1
+
+    out3 = tracker.update(det, img)
+    assert out3.shape[0] == 1
+
+
 def test_bytetrack_exit_zone_margin_zero_is_disabled():
     tracker = ByteTrack(
         exit_zone_enabled=True,
@@ -421,7 +444,7 @@ def test_bytetrack_birth_confirm_requires_two_hits():
     tracker = ByteTrack(
         new_track_thresh=0.6,
         birth_confirm_frames=2,
-        entry_margin=0,
+        entry_margin=50,
         strict_entry_gate=False,
         adaptive_zone_enabled=False,
         zombie_max_history=0,
