@@ -13,6 +13,7 @@ from boxmot.trackers.deepocsort.deepocsort import (
     KalmanBoxTracker as DeepOCSortKalmanBoxTracker,
 )
 from boxmot.trackers.bytetrack.bytetrack import ByteTrack
+from boxmot.trackers.bytetrack.spatial_prior import SpatialPriorField
 from boxmot.trackers.ocsort.ocsort import KalmanBoxTracker as OCSortKalmanBoxTracker
 from boxmot.utils import WEIGHTS
 from tests.test_config import (
@@ -523,6 +524,112 @@ def test_bytetrack_pending_birth_expires_without_consecutive_confirmation():
     assert len(tracker.active_tracks) == 0
 
 
+def _make_reid_ready_bytetrack(**kwargs) -> ByteTrack:
+    tracker = ByteTrack(**kwargs)
+    tracker.with_reid = True
+    tracker.zombie_reid_enabled = True
+    tracker.model = None
+    return tracker
+
+
+def test_bytetrack_zombie_reid_global_assignment_prefers_appearance():
+    tracker = _make_reid_ready_bytetrack(
+        entry_margin=50,
+        strict_entry_gate=False,
+        adaptive_zone_enabled=False,
+        zombie_max_history=10,
+        zombie_transition_frames=1,
+        zombie_match_max_dist=150,
+        zombie_dist_thresh=150,
+        zombie_reid_thresh=0.2,
+        zombie_match_cost_thresh=0.45,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    empty = np.empty((0, 6), dtype=np.float32)
+
+    dets = np.array(
+        [
+            [180, 120, 240, 280, 0.95, 0],
+            [320, 120, 380, 280, 0.95, 0],
+        ],
+        dtype=np.float32,
+    )
+    embs = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    out1 = tracker.update(dets, img, embs)
+    assert out1.shape[0] == 2
+    ids_by_x = {
+        int((row[0] + row[2]) / 2): int(row[4]) for row in out1
+    }
+    left_id = min(ids_by_x.items(), key=lambda item: item[0])[1]
+    right_id = max(ids_by_x.items(), key=lambda item: item[0])[1]
+
+    tracker.update(empty, img)
+    tracker.update(empty, img)
+    assert len(tracker.zombie_stracks) == 2
+
+    crossed_dets = np.array(
+        [
+            [290, 120, 350, 280, 0.95, 0],
+            [210, 120, 270, 280, 0.95, 0],
+        ],
+        dtype=np.float32,
+    )
+    crossed_embs = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    out4 = tracker.update(crossed_dets, img, crossed_embs)
+    assert out4.shape[0] == 2
+    rescued = {int((row[0] + row[2]) / 2): int(row[4]) for row in out4}
+    assert max(rescued.items(), key=lambda item: item[0])[1] == left_id
+    assert min(rescued.items(), key=lambda item: item[0])[1] == right_id
+
+
+def test_bytetrack_zombie_reid_gate_blocks_wrong_appearance_rescue():
+    tracker = _make_reid_ready_bytetrack(
+        entry_margin=50,
+        strict_entry_gate=True,
+        adaptive_zone_enabled=False,
+        zombie_max_history=10,
+        zombie_transition_frames=1,
+        zombie_match_max_dist=150,
+        zombie_dist_thresh=150,
+        zombie_reid_thresh=0.2,
+        zombie_match_cost_thresh=0.45,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    empty = np.empty((0, 6), dtype=np.float32)
+
+    det = np.array([[240, 120, 300, 280, 0.95, 0]], dtype=np.float32)
+    emb = np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+
+    out1 = tracker.update(det, img, emb)
+    assert out1.shape[0] == 1
+
+    tracker.update(empty, img)
+    tracker.update(empty, img)
+    assert len(tracker.zombie_stracks) == 1
+
+    wrong_det = np.array([[260, 120, 320, 280, 0.95, 0]], dtype=np.float32)
+    wrong_emb = np.array([[0.0, 1.0, 0.0, 0.0]], dtype=np.float32)
+
+    out4 = tracker.update(wrong_det, img, wrong_emb)
+    assert out4.size == 0
+    assert len(tracker.active_tracks) == 0
+    assert len(tracker.zombie_stracks) == 1
+
+
 def test_bytetrack_spatial_prior_commits_stable_birth_and_support():
     tracker = ByteTrack(
         entry_margin=0,
@@ -578,6 +685,24 @@ def test_bytetrack_spatial_prior_skips_first_frame_births():
     assert tracker.spatial_prior_birth_events == 0
     assert stats.birth_total == 0.0
     assert stats.support_total > 0.0
+
+
+def test_spatial_prior_lazy_decay_preserves_effective_mass():
+    field = SpatialPriorField(grid_w=12, grid_h=8, sigma=1.5, decay=0.9)
+    field.configure_image(100, 80)
+
+    point = np.array([37.5, 42.0], dtype=np.float32)
+    field.add_support(point, weight=2.0)
+    stats = field.stats()
+    assert stats.support_total == pytest.approx(2.0, rel=1e-6)
+
+    field.step()
+    stats = field.stats()
+    assert stats.support_total == pytest.approx(1.8, rel=1e-6)
+
+    field.add_support(point, weight=2.0)
+    stats = field.stats()
+    assert stats.support_total == pytest.approx(3.8, rel=1e-6)
 
 
 def test_bytetrack_spatial_entry_region_uses_walkable_outer_band():
