@@ -14,11 +14,12 @@ MOTION_N_APPEARANCE_TRACKING_NAMES = [
     "strongsort",
     "boosttrack",
     "hybridsort",
+    "bytetrack",
 ]
-MOTION_ONLY_TRACKING_NAMES = ["ocsort", "bytetrack"]
+MOTION_ONLY_TRACKING_NAMES = ["ocsort"]
 
-MOTION_N_APPEARANCE_TRACKING_METHODS = [StrongSort, BotSort, DeepOcSort, BoostTrack, HybridSort]
-MOTION_ONLY_TRACKING_METHODS = [OcSort, ByteTrack]
+MOTION_N_APPEARANCE_TRACKING_METHODS = [StrongSort, BotSort, DeepOcSort, BoostTrack, HybridSort, ByteTrack]
+MOTION_ONLY_TRACKING_METHODS = [OcSort]
 
 ALL_TRACKERS = [
     "botsort",

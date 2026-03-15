@@ -84,6 +84,46 @@ zombie_max_predict_frames:
   default: 0  # disabled
   range: [3, 11, 1]
 
+zombie_reid_enabled:
+  type: choice
+  default: true
+  options: [true, false]
+
+zombie_reid_weight:
+  type: uniform
+  default: 0.75
+  range: [0.4, 0.95]
+
+zombie_motion_weight:
+  type: uniform
+  default: 0.2
+  range: [0.0, 0.4]
+
+zombie_shape_weight:
+  type: uniform
+  default: 0.05
+  range: [0.0, 0.2]
+
+zombie_reid_thresh:
+  type: uniform
+  default: 0.35
+  range: [0.1, 0.6]
+
+zombie_match_cost_thresh:
+  type: uniform
+  default: 0.45
+  range: [0.2, 0.8]
+
+zombie_shape_max_ratio:
+  type: uniform
+  default: 2.0
+  range: [1.2, 4.0]
+
+zombie_reid_min_box_area:
+  type: qrandint
+  default: 1024
+  range: [0, 4097, 256]
+
 # Exit zone configuration
 exit_zone_enabled:
   type: choice
