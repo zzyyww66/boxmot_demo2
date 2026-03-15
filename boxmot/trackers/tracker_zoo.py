@@ -5,7 +5,7 @@ import yaml
 
 from boxmot.utils import TRACKER_CONFIGS
 
-REID_TRACKERS = ["strongsort", "botsort", "deepocsort", "hybridsort", "boosttrack"]
+REID_TRACKERS = ["strongsort", "botsort", "deepocsort", "hybridsort", "boosttrack", "bytetrack"]
 
 TRACKER_MAPPING = {
     "strongsort": "boxmot.trackers.strongsort.strongsort.StrongSort",

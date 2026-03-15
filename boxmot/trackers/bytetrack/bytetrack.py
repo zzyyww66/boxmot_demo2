@@ -1,21 +1,28 @@
 # Mikel Broström 🔥 BoxMOT 🧾 AGPL-3.0 license
 
 from collections import deque
+from pathlib import Path
 
 import numpy as np
+import torch
 
 from boxmot.motion.kalman_filters.aabb.xyah_kf import KalmanFilterXYAH
+from boxmot.reid.core.auto_backend import ReidAutoBackend
 from boxmot.trackers.basetracker import BaseTracker
 from boxmot.trackers.bytetrack.basetrack import BaseTrack, TrackState
 from boxmot.trackers.bytetrack.spatial_prior import SpatialPriorField
-from boxmot.utils.matching import fuse_score, iou_distance, linear_assignment
+from boxmot.utils.matching import (
+    fuse_score,
+    iou_distance,
+    linear_assignment,
+)
 from boxmot.utils.ops import tlwh2xyah, xywh2tlwh, xywh2xyxy, xyxy2xywh
 
 
 class STrack(BaseTrack):
     shared_kalman = KalmanFilterXYAH()
 
-    def __init__(self, det, max_obs):
+    def __init__(self, det, max_obs, feat=None, feat_history=50):
         # wait activate
         self.xywh = xyxy2xywh(det[0:4])  # (x1, y1, x2, y2) --> (xc, yc, w, h)
         self.tlwh = xywh2tlwh(self.xywh)  # (xc, yc, w, h) --> (t, l, w, h)
@@ -29,9 +36,27 @@ class STrack(BaseTrack):
         self.is_activated = False
         self.tracklet_len = 0
         self.history_observations = deque([], maxlen=self.max_obs)
+        self.features = deque(maxlen=feat_history)
+        self.smooth_feat = None
+        self.curr_feat = None
+        self.alpha = 0.9
         self.spatial_birth_frame = -1
         self.spatial_birth_point = None
         self.spatial_birth_committed = False
+        if feat is not None:
+            self.update_features(feat)
+
+    def update_features(self, feat: np.ndarray) -> None:
+        """Normalize and smooth appearance features for later zombie rescue."""
+        feat = np.asarray(feat, dtype=np.float32)
+        feat /= np.linalg.norm(feat) + 1e-12
+        self.curr_feat = feat
+        if self.smooth_feat is None:
+            self.smooth_feat = feat
+        else:
+            self.smooth_feat = self.alpha * self.smooth_feat + (1 - self.alpha) * feat
+            self.smooth_feat /= np.linalg.norm(self.smooth_feat) + 1e-12
+        self.features.append(feat)
 
     def predict(self):
         mean_state = self.mean.copy()
@@ -74,6 +99,8 @@ class STrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.update(
             self.mean, self.covariance, new_track.xyah
         )
+        if new_track.curr_feat is not None:
+            self.update_features(new_track.curr_feat)
         self.tracklet_len = 0
         self.state = TrackState.Tracked
         self.is_activated = True
@@ -101,10 +128,24 @@ class STrack(BaseTrack):
         )
         self.state = TrackState.Tracked
         self.is_activated = True
+        if new_track.curr_feat is not None:
+            self.update_features(new_track.curr_feat)
 
         self.conf = new_track.conf
         self.cls = new_track.cls
         self.det_ind = new_track.det_ind
+
+    def footpoint(self) -> np.ndarray:
+        """Return the bottom-center point of the current track box."""
+        if self.mean is None:
+            center_x = float(self.xywh[0])
+            center_y = float(self.xywh[1])
+            height = float(self.xywh[3])
+        else:
+            center_x = float(self.mean[0])
+            center_y = float(self.mean[1])
+            height = float(self.mean[3])
+        return np.array([center_x, center_y + 0.5 * height], dtype=np.float32)
 
     @property
     def xyxy(self):
@@ -204,6 +245,9 @@ class ByteTrack(BaseTracker):
 
     def __init__(
         self,
+        reid_weights: Path | None = None,
+        device: torch.device | str = torch.device("cpu"),
+        half: bool = False,
         # ByteTrack-specific parameters
         min_conf: float = 0.1,
         track_thresh: float = 0.45,
@@ -232,6 +276,16 @@ class ByteTrack(BaseTracker):
         # Motion model
         self.kalman_filter = KalmanFilterXYAH()
 
+        # Appearance model for long-gap zombie rescue only.
+        self.with_reid = bool(kwargs.get("with_reid", True)) and reid_weights is not None
+        self.model = None
+        if self.with_reid:
+            self.model = ReidAutoBackend(
+                weights=reid_weights,
+                device=device,
+                half=half,
+            ).model
+
         # Lifecycle gating configuration (scene-mask based birth control and zombie rescue)
         self.entry_margin = kwargs.get('entry_margin', 0)  # Entry zone pixel width (0 = disabled)
         self.strict_entry_gate = kwargs.get('strict_entry_gate', False)  # Center unmatched detections cannot spawn IDs when gating is on
@@ -244,6 +298,14 @@ class ByteTrack(BaseTracker):
         self.zombie_transition_frames = kwargs.get('zombie_transition_frames', self.buffer_size)  # 转为僵尸的帧数阈值
         self.zombie_match_max_dist = kwargs.get('zombie_match_max_dist', 200)  # 僵尸匹配距离上限（像素）
         self.lost_max_history = kwargs.get('lost_max_history', 0)  # 0 means unlimited
+        self.zombie_reid_enabled = bool(kwargs.get("zombie_reid_enabled", self.with_reid))
+        self.zombie_reid_weight = float(kwargs.get("zombie_reid_weight", 0.75))
+        self.zombie_motion_weight = float(kwargs.get("zombie_motion_weight", 0.20))
+        self.zombie_shape_weight = float(kwargs.get("zombie_shape_weight", 0.05))
+        self.zombie_reid_thresh = float(kwargs.get("zombie_reid_thresh", 0.35))
+        self.zombie_match_cost_thresh = float(kwargs.get("zombie_match_cost_thresh", 0.45))
+        self.zombie_shape_max_ratio = float(kwargs.get("zombie_shape_max_ratio", 2.0))
+        self.zombie_reid_min_box_area = float(kwargs.get("zombie_reid_min_box_area", 1024.0))
 
         # Soft birth gating (optional, disabled by default for backwards compatibility)
         self.birth_confirm_frames = max(1, int(kwargs.get('birth_confirm_frames', 1)))
@@ -309,6 +371,7 @@ class ByteTrack(BaseTracker):
         )
         self.spatial_entry_mask = None
         self.spatial_core_mask = None
+        self._spatial_region_dirty = False
         self.spatial_prior_support_samples = 0
         self.spatial_prior_birth_events = 0
         self.spatial_prior_stage = "learn_only"
@@ -322,17 +385,6 @@ class ByteTrack(BaseTracker):
         """Return whether the passive spatial-prior learner is enabled."""
         return self.spatial_prior is not None
 
-    @staticmethod
-    def _footpoint_from_xyxy(xyxy: np.ndarray) -> np.ndarray:
-        """Convert an xyxy box into a bottom-center footpoint."""
-        return np.array(
-            [
-                (float(xyxy[0]) + float(xyxy[2])) * 0.5,
-                float(xyxy[3]),
-            ],
-            dtype=np.float32,
-        )
-
     def _register_spatial_birth(self, track: STrack) -> None:
         """Attach provisional birth metadata to a newly activated track."""
         if not self._spatial_prior_active():
@@ -342,26 +394,36 @@ class ByteTrack(BaseTracker):
             track.spatial_birth_point = None
             track.spatial_birth_committed = True
             return
-        track.spatial_birth_point = self._footpoint_from_xyxy(track.xyxy)
+        track.spatial_birth_point = track.footpoint()
         track.spatial_birth_committed = False
 
     def _update_spatial_prior_tracks(self) -> None:
         """Update support counts and commit stabilized birth events."""
         if not self._spatial_prior_active():
             return
+        support_points: list[np.ndarray] = []
+        birth_points: list[np.ndarray] = []
         for track in self.active_tracks:
             if not track.is_activated or track.state != TrackState.Tracked:
                 continue
             age = max(1, self.frame_count - track.start_frame + 1)
             if age >= self.spatial_prior_support_min_age:
-                self._spatial_prior_add_support(self._footpoint_from_xyxy(track.xyxy))
+                support_points.append(track.footpoint())
             if track.spatial_birth_committed:
                 continue
             hits = track.tracklet_len + 1
             if age >= self.spatial_prior_birth_commit_age or hits >= self.spatial_prior_birth_commit_hits:
                 if track.spatial_birth_point is not None:
-                    self._spatial_prior_add_birth(track.spatial_birth_point)
+                    birth_points.append(track.spatial_birth_point)
                 track.spatial_birth_committed = True
+        if support_points:
+            self.spatial_prior.add_support_batch(support_points)
+            self.spatial_prior_support_samples += len(support_points)
+            self._spatial_region_dirty = True
+        if birth_points:
+            self.spatial_prior.add_birth_batch(birth_points)
+            self.spatial_prior_birth_events += len(birth_points)
+            self._spatial_region_dirty = True
 
     def _spatial_prior_add_support(self, point: np.ndarray) -> None:
         """Add one support sample to the field and maturity counters."""
@@ -369,6 +431,7 @@ class ByteTrack(BaseTracker):
             return
         self.spatial_prior.add_support(point)
         self.spatial_prior_support_samples += 1
+        self._spatial_region_dirty = True
 
     def _spatial_prior_add_birth(self, point: np.ndarray) -> None:
         """Add one confirmed birth event to the field and maturity counters."""
@@ -376,6 +439,7 @@ class ByteTrack(BaseTracker):
             return
         self.spatial_prior.add_birth(point)
         self.spatial_prior_birth_events += 1
+        self._spatial_region_dirty = True
 
     def _update_spatial_prior_stage(self) -> None:
         """Advance the spatial-prior maturity stage using hard thresholds."""
@@ -511,6 +575,7 @@ class ByteTrack(BaseTracker):
         if not self._spatial_region_ready():
             self.spatial_entry_mask = None
             self.spatial_core_mask = None
+            self._spatial_region_dirty = False
             return
 
         prob_maps = self.spatial_prior.get_probability_maps()
@@ -538,9 +603,12 @@ class ByteTrack(BaseTracker):
         core = eligible & ~entry
         self.spatial_entry_mask = entry
         self.spatial_core_mask = core
+        self._spatial_region_dirty = False
 
     def _get_spatial_region_label(self, point: np.ndarray) -> str | None:
         """Return the explicit spatial region label for a point, if masks are ready."""
+        if self._spatial_region_dirty:
+            self._refresh_spatial_region_masks()
         if self.spatial_entry_mask is None or self.spatial_core_mask is None:
             return None
         ix, iy = self.spatial_prior.point_to_index(point)
@@ -838,9 +906,143 @@ class ByteTrack(BaseTracker):
 
         return np.sqrt((c1_x - c2_x) ** 2 + (c1_y - c2_y) ** 2)
 
+    @staticmethod
+    def _calculate_shape_cost(box1_tlwh, box2_tlwh) -> float:
+        """Return a bounded shape mismatch cost based on width/height ratios."""
+        w1, h1 = float(box1_tlwh[2]), float(box1_tlwh[3])
+        w2, h2 = float(box2_tlwh[2]), float(box2_tlwh[3])
+        if min(w1, h1, w2, h2) <= 1e-6:
+            return 1.0
+        width_ratio = max(w1, w2) / max(min(w1, w2), 1e-6)
+        height_ratio = max(h1, h2) / max(min(h1, h2), 1e-6)
+        return min(1.0, 0.5 * (abs(np.log(width_ratio)) + abs(np.log(height_ratio))))
+
+    def _zombie_gate_dist(self, max_dist=None) -> float:
+        """Resolve the effective spatial gate used before zombie ReID matching."""
+        if max_dist is None:
+            max_dist = self.zombie_match_max_dist
+        if self.zombie_dist_thresh > 0:
+            max_dist = min(max_dist, self.zombie_dist_thresh)
+        return float(max_dist)
+
+    def _zombie_reid_ready(self) -> bool:
+        """Return True when the tracker can perform appearance-based zombie rescue."""
+        return bool(self.zombie_reid_enabled and self.with_reid)
+
+    def _build_zombie_match_cost(
+        self,
+        detection_tracks: list[STrack],
+        zombie_stracks: list[STrack],
+        max_dist: float,
+    ) -> np.ndarray:
+        """Build a gated cost matrix for zombie rescue.
+
+        Rows correspond to zombie tracks, columns correspond to unmatched detections.
+        Invalid pairs are assigned a cost higher than the assignment threshold.
+        """
+        invalid_cost = self.zombie_match_cost_thresh + 1.0
+        cost_matrix = np.full(
+            (len(zombie_stracks), len(detection_tracks)),
+            invalid_cost,
+            dtype=np.float32,
+        )
+        if cost_matrix.size == 0:
+            return cost_matrix
+
+        emb_cost = None
+        if self._zombie_reid_ready():
+            if not all(zombie.smooth_feat is not None for zombie in zombie_stracks) or not all(
+                det.curr_feat is not None for det in detection_tracks
+            ):
+                return cost_matrix
+            zombie_features = [
+                np.asarray(zombie.smooth_feat, dtype=np.float32).reshape(-1)
+                for zombie in zombie_stracks
+            ]
+            det_features = [
+                np.asarray(det.curr_feat, dtype=np.float32).reshape(-1)
+                for det in detection_tracks
+            ]
+            feature_dim = zombie_features[0].shape[0]
+            if feature_dim == 0 or any(feat.shape[0] != feature_dim for feat in zombie_features + det_features):
+                return cost_matrix
+            zombie_features = np.vstack(zombie_features)
+            det_features = np.vstack(det_features)
+            emb_cost = 1.0 - np.clip(zombie_features @ det_features.T, -1.0, 1.0)
+
+        weight_sum = max(
+            self.zombie_reid_weight + self.zombie_motion_weight + self.zombie_shape_weight,
+            1e-6,
+        )
+
+        for iz, zombie in enumerate(zombie_stracks):
+            zombie_tlwh = zombie.get_tlwh_for_matching(
+                frame_id=self.frame_count,
+                max_predict_frames=self.zombie_max_predict_frames,
+            )
+            for idet, det_track in enumerate(detection_tracks):
+                det_tlwh = det_track.tlwh
+                det_area = float(det_tlwh[2] * det_tlwh[3])
+                if self._zombie_reid_ready() and det_area < self.zombie_reid_min_box_area:
+                    continue
+
+                dist = self._calculate_center_distance(det_tlwh, zombie_tlwh)
+                if dist > max_dist:
+                    continue
+
+                width_ratio = max(det_tlwh[2], zombie_tlwh[2]) / max(min(det_tlwh[2], zombie_tlwh[2]), 1e-6)
+                height_ratio = max(det_tlwh[3], zombie_tlwh[3]) / max(min(det_tlwh[3], zombie_tlwh[3]), 1e-6)
+                if max(width_ratio, height_ratio) > self.zombie_shape_max_ratio:
+                    continue
+
+                motion_cost = min(1.0, dist / max(max_dist, 1e-6))
+                shape_cost = self._calculate_shape_cost(det_tlwh, zombie_tlwh)
+
+                if emb_cost is not None:
+                    reid_cost = float(emb_cost[iz, idet])
+                    if reid_cost > self.zombie_reid_thresh:
+                        continue
+                    total_cost = (
+                        self.zombie_reid_weight * reid_cost
+                        + self.zombie_motion_weight * motion_cost
+                        + self.zombie_shape_weight * shape_cost
+                    ) / weight_sum
+                else:
+                    total_cost = (
+                        self.zombie_motion_weight * motion_cost
+                        + self.zombie_shape_weight * shape_cost
+                    ) / max(self.zombie_motion_weight + self.zombie_shape_weight, 1e-6)
+
+                cost_matrix[iz, idet] = total_cost
+
+        return cost_matrix
+
+    def _match_zombie_tracks(
+        self,
+        detection_tracks: list[STrack],
+        zombie_stracks: list[STrack],
+        max_dist=None,
+    ):
+        """Match center-zone unmatched detections to zombie tracks with global assignment."""
+        if not self._zombie_enabled() or not detection_tracks or not zombie_stracks:
+            return [], tuple(range(len(detection_tracks)))
+
+        max_dist = self._zombie_gate_dist(max_dist=max_dist)
+        cost_matrix = self._build_zombie_match_cost(detection_tracks, zombie_stracks, max_dist)
+        matches, unmatched_zombies, unmatched_dets = linear_assignment(
+            cost_matrix,
+            thresh=self.zombie_match_cost_thresh,
+        )
+        matched_pairs = []
+        for iz, idet in matches:
+            zombie = zombie_stracks[iz]
+            det_track = detection_tracks[idet]
+            zombie.re_activate(det_track, self.frame_count, new_id=False)
+            matched_pairs.append((int(idet), zombie))
+        return matched_pairs, tuple(int(i) for i in unmatched_dets)
 
     def _try_match_zombie(self, detection, zombie_stracks, max_dist=None):
-        """Try to match detection with zombie tracks using nearest distance.
+        """Compatibility wrapper for single-detection zombie rescue.
 
         Args:
             detection: STrack object, unmatched detection
@@ -850,35 +1052,9 @@ class ByteTrack(BaseTracker):
         Returns:
             STrack or None: Matched zombie track if found within max_dist, None otherwise
         """
-        if max_dist is None:
-            max_dist = self.zombie_match_max_dist
-        if self.zombie_dist_thresh > 0:
-            max_dist = min(max_dist, self.zombie_dist_thresh)
-        if not self._zombie_enabled():
-            return None
-
-        if len(zombie_stracks) == 0:
-            return None
-
-        best_dist = float('inf')
-        best_zombie = None
-
-        for zombie in zombie_stracks:
-            zombie_tlwh = zombie.get_tlwh_for_matching(
-                frame_id=self.frame_count,
-                max_predict_frames=self.zombie_max_predict_frames
-            )
-
-            dist = self._calculate_center_distance(detection.tlwh, zombie_tlwh)
-            if dist < best_dist:
-                best_dist = dist
-                best_zombie = zombie
-
-        if best_dist < max_dist:
-            # Reactivate the nearest zombie
-            best_zombie.re_activate(detection, self.frame_count, new_id=False)
-            return best_zombie
-
+        matches, _ = self._match_zombie_tracks([detection], zombie_stracks, max_dist=max_dist)
+        if matches:
+            return matches[0][1]
         return None
 
     def _prune_pending_births(self):
@@ -953,9 +1129,15 @@ class ByteTrack(BaseTracker):
 
         return best_idx
 
-    def _try_activate_new_track(self, det_track, activated_starcks, reference_tracks):
-        """Apply duplicate suppression and temporal confirmation before spawning a new ID."""
-        if self.birth_confirm_frames <= 1:
+    def _try_activate_new_track(
+        self,
+        det_track,
+        activated_starcks,
+        reference_tracks,
+        skip_confirmation: bool = False,
+    ):
+        """Apply duplicate suppression and optional temporal confirmation before spawning a new ID."""
+        if skip_confirmation or self.birth_confirm_frames <= 1:
             if self._is_birth_suppressed(det_track, reference_tracks):
                 return False
             det_track.activate(self.kalman_filter, self.frame_count)
@@ -998,7 +1180,7 @@ class ByteTrack(BaseTracker):
         self, dets: np.ndarray, img: np.ndarray = None, embs: np.ndarray = None
     ) -> np.ndarray:
 
-        self.check_inputs(dets, img)
+        self.check_inputs(dets, img, embs)
 
         dets = np.hstack([dets, np.arange(len(dets)).reshape(-1, 1)])
         self.frame_count += 1
@@ -1014,7 +1196,7 @@ class ByteTrack(BaseTracker):
             self.spatial_prior.configure_image(self.img_w, self.img_h)
             self.spatial_prior.step()
             if self._spatial_region_ready() or self.spatial_entry_mask is not None or self.spatial_core_mask is not None:
-                self._refresh_spatial_region_masks()
+                self._spatial_region_dirty = True
         if img is not None:
             current_img_shape = img.shape[:2]
         elif hasattr(self, 'h') and hasattr(self, 'w'):
@@ -1036,10 +1218,20 @@ class ByteTrack(BaseTracker):
 
         dets_second = dets[inds_second]
         dets = dets[remain_inds]
+        embs_first = embs[remain_inds] if embs is not None else None
+
+        if self.with_reid and embs_first is None and len(dets) > 0:
+            embs_first = self.model.get_features(dets[:, 0:4], img)
 
         if len(dets) > 0:
             """Detections"""
-            detections = [STrack(det, max_obs=self.max_obs) for det in dets]
+            if embs_first is not None:
+                detections = [
+                    STrack(det, max_obs=self.max_obs, feat=feat)
+                    for det, feat in zip(dets, embs_first)
+                ]
+            else:
+                detections = [STrack(det, max_obs=self.max_obs) for det in dets]
         else:
             detections = []
 
@@ -1162,6 +1354,7 @@ class ByteTrack(BaseTracker):
                 activated_starcks.append(det_track)
         else:
             # Normal frames: process unmatched detections
+            center_zone_detections = []
             for inew in u_detection:
                 det_track = detections[inew]
                 if det_track.conf < self.new_track_thresh:
@@ -1196,7 +1389,9 @@ class ByteTrack(BaseTracker):
                 det_tlwh = det_track.tlwh
                 is_entry = self._is_in_entry_zone(det_tlwh, current_img_shape)
                 if is_entry:
-                    # In entry zone -> create new ID (original behavior)
+                    # Entry-zone births use original ByteTrack activation semantics:
+                    # activate immediately, then let the usual unconfirmed stage decide
+                    # whether the track stabilizes on the next frame.
                     birth_refs = self._collect_birth_reference_tracks(
                         self.active_tracks,
                         self.lost_stracks,
@@ -1205,29 +1400,38 @@ class ByteTrack(BaseTracker):
                         refind_stracks,
                         lost_stracks,
                     )
-                    self._try_activate_new_track(det_track, activated_starcks, birth_refs)
+                    self._try_activate_new_track(
+                        det_track,
+                        activated_starcks,
+                        birth_refs,
+                        skip_confirmation=True,
+                    )
                 else:
-                    # In center zone -> try match with zombie tracks
-                    # Zombie tracks are those lost for > 30 frames
-                    zombie = self._try_match_zombie(det_track, self.zombie_stracks)
-                    if zombie:
-                        # Rescued a zombie track!
-                        refind_stracks.append(zombie)
-                        rescued_zombies.append(zombie)
-                    else:
-                        # Strict entry gate: center-zone detections do not spawn new IDs.
-                        # This is the core "严进" policy for fixed-camera deployments.
-                        if self.strict_entry_gate and self.entry_margin > 0:
-                            continue
-                        birth_refs = self._collect_birth_reference_tracks(
-                            self.active_tracks,
-                            self.lost_stracks,
-                            self.zombie_stracks,
-                            activated_starcks,
-                            refind_stracks,
-                            lost_stracks,
-                        )
-                        self._try_activate_new_track(det_track, activated_starcks, birth_refs)
+                    center_zone_detections.append(det_track)
+
+            unmatched_center_zone = tuple(range(len(center_zone_detections)))
+            if center_zone_detections:
+                matched_pairs, unmatched_center_zone = self._match_zombie_tracks(
+                    center_zone_detections,
+                    self.zombie_stracks,
+                )
+                for _, zombie in matched_pairs:
+                    refind_stracks.append(zombie)
+                    rescued_zombies.append(zombie)
+
+            for local_idx in unmatched_center_zone:
+                det_track = center_zone_detections[local_idx]
+                if self.strict_entry_gate and self.entry_margin > 0:
+                    continue
+                birth_refs = self._collect_birth_reference_tracks(
+                    self.active_tracks,
+                    self.lost_stracks,
+                    self.zombie_stracks,
+                    activated_starcks,
+                    refind_stracks,
+                    lost_stracks,
+                )
+                self._try_activate_new_track(det_track, activated_starcks, birth_refs)
 
         """ Step 5: Update lost tracks and transition to zombie """
         # Add newly lost tracks to self.lost_stracks

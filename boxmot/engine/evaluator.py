@@ -49,7 +49,7 @@ COCO_CLASSES = [
     'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
 ]
 
-MOTION_ONLY_TRACKERS = {"bytetrack", "ocsort"}
+MOTION_ONLY_TRACKERS = {"ocsort"}
 
 
 def is_motion_only_tracker(tracking_method: str) -> bool:

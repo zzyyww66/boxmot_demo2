@@ -49,6 +49,72 @@ source .venv/bin/activate
 python -m boxmot.engine.cli --help
 ```
 
+### Local Environment Notes
+
+- The current `.venv` has been validated on the local Blackwell GPU with:
+
+  ```bash
+  torch==2.10.0+cu128
+  torchvision==0.25.0+cu128
+  ```
+
+- `osnet_x0_25_msmt17.pt` is present in the repo root:
+
+  ```bash
+  /root/autodl-tmp/boxmot/boxmot_demo2/osnet_x0_25_msmt17.pt
+  ```
+
+- The local SOMPT22 dataset used for evaluation is under:
+
+  ```bash
+  /root/autodl-tmp/boxmot/boxmot_demo2/train
+  ```
+
+- Legacy cached outputs exist under the default `runs/` tree, but the old embedding cache below contains placeholder data and must **not** be used for final evaluation of the current ReID-enabled ByteTrack:
+
+  ```bash
+  /root/autodl-tmp/boxmot/boxmot_demo2/runs/dets_n_embs/yolov8m_pretrain_crowdhuman/dets
+  /root/autodl-tmp/boxmot/boxmot_demo2/runs/dets_n_embs/yolov8m_pretrain_crowdhuman/embs/osnet_x0_25_msmt17
+  ```
+
+- The latest full fresh rerun that regenerated both detections and embeddings is under:
+
+  ```bash
+  /root/autodl-tmp/boxmot/boxmot_demo2/runs_fullrerun_20260315_094907
+  ```
+
+- Freshly generated detector outputs, embeddings, and MOT results for that run are:
+
+  ```bash
+  /root/autodl-tmp/boxmot/boxmot_demo2/runs_fullrerun_20260315_094907/dets_n_embs/yolov8m_pretrain_crowdhuman/dets
+  /root/autodl-tmp/boxmot/boxmot_demo2/runs_fullrerun_20260315_094907/dets_n_embs/yolov8m_pretrain_crowdhuman/embs/osnet_x0_25_msmt17
+  /root/autodl-tmp/boxmot/boxmot_demo2/runs_fullrerun_20260315_094907/mot/yolov8m_pretrain_crowdhuman_osnet_x0_25_msmt17_bytetrack
+  /root/autodl-tmp/boxmot/boxmot_demo2/runs_fullrerun_20260315_094907/eval.log
+  ```
+
+- Latest verified full fresh eval summary on the local SOMPT22 split:
+
+  ```text
+  HOTA=53.023
+  MOTA=65.710
+  IDF1=66.179
+  IDSW=815
+  Association FPS=18.9
+  ```
+
+- Current implementation status for ByteTrack:
+  - Step1/Step2 keep the standard ByteTrack high-score / low-score association flow.
+  - ReID is only injected into the final zombie-rescue stage.
+  - Zombie rescue uses `center-distance hard gate + shape gate + ReID-dominant weighted cost + Hungarian assignment`.
+  - Main implementation files:
+
+    ```bash
+    /root/autodl-tmp/boxmot/boxmot_demo2/boxmot/trackers/bytetrack/bytetrack.py
+    /root/autodl-tmp/boxmot/boxmot_demo2/boxmot/configs/trackers/bytetrack_improved.yaml
+    /root/autodl-tmp/boxmot/boxmot_demo2/boxmot/trackers/tracker_zoo.py
+    /root/autodl-tmp/boxmot/boxmot_demo2/boxmot/engine/evaluator.py
+    ```
+
 ## 2. Workflow
 
 - Create feature branches for work:
@@ -138,6 +204,36 @@ PR / task descriptions should include:
   uv run python -m boxmot.engine.cli generate --source <path-or-url> ...
   uv run python -m boxmot.engine.cli eval --source <path-or-url> ...
   uv run python -m boxmot.engine.cli tune --source <path-or-url> ...
+  ```
+
+- For the current ReID-enhanced ByteTrack work, use this focused regression command first:
+
+  ```bash
+  uv run pytest tests/unit/test_trackers.py -k "zombie_reid_global_assignment_prefers_appearance or zombie_reid_gate_blocks_wrong_appearance_rescue"
+  ```
+
+- To run a **fresh** SOMPT22 eval that does not reuse old placeholder embeddings, always write into a new `--project` directory or manually remove that directory's `dets_n_embs/` subtree first:
+
+  ```bash
+  RUN_ROOT=/root/autodl-tmp/boxmot/boxmot_demo2/runs_fullrerun_$(date -u +%Y%m%d_%H%M%S)
+
+  uv run python -m boxmot.engine.cli eval \
+    yolov8m_pretrain_crowdhuman \
+    osnet_x0_25_msmt17 \
+    bytetrack \
+    --source /root/autodl-tmp/boxmot/boxmot_demo2/train \
+    --tracker-config /root/autodl-tmp/boxmot/boxmot_demo2/boxmot/configs/trackers/bytetrack_improved.yaml \
+    --device 0 \
+    --project "$RUN_ROOT" \
+    --exist-ok \
+    --verbose
+  ```
+
+- After a fresh eval, inspect these files first:
+
+  ```bash
+  tail -n 80 "$RUN_ROOT/eval.log"
+  sed -n '1,5p' "$RUN_ROOT/mot/yolov8m_pretrain_crowdhuman_osnet_x0_25_msmt17_bytetrack/person_summary.txt"
   ```
 
 **If tests or commands cannot be run**
