@@ -64,6 +64,10 @@ python -m boxmot.engine.cli --help
   /root/autodl-tmp/boxmot/boxmot_demo2/osnet_x0_25_msmt17.pt
   ```
 
+- Test-time ReID weights are currently standardized on `osnet_x0_25_msmt17.pt`.
+  - `tests/unit/test_trackers.py` and related tracker/performance tests now use this weight by default.
+  - If `boxmot/engine/weights/osnet_x0_25_msmt17.pt` is missing but the repo-root file above exists, the ReID backend now reuses the repo-root file instead of attempting a fresh download.
+
 - The local SOMPT22 dataset used for evaluation is under:
 
   ```bash
@@ -211,6 +215,17 @@ PR / task descriptions should include:
   ```bash
   uv run pytest tests/unit/test_trackers.py -k "zombie_reid_global_assignment_prefers_appearance or zombie_reid_gate_blocks_wrong_appearance_rescue"
   ```
+
+- Current locally verified tracker test commands:
+
+  ```bash
+  uv run pytest tests/unit/test_reidbackend.py -k "resolves_existing_root_weights_before_download"
+  uv run pytest tests/unit/test_trackers.py
+  ```
+
+  Notes:
+  - `tests/unit/test_trackers.py` is currently verified passing locally with `98 passed`.
+  - When touching tracker tests, continue using `osnet_x0_25_msmt17.pt` unless there is a very specific reason to validate another ReID weight.
 
 - To run a **fresh** SOMPT22 eval that does not reuse old placeholder embeddings, always write into a new `--project` directory or manually remove that directory's `dets_n_embs/` subtree first:
 

@@ -9,7 +9,7 @@ import torch
 from filelock import SoftFileLock
 
 from boxmot.reid.core.registry import ReIDModelRegistry
-from boxmot.utils import logger as LOGGER
+from boxmot.utils import ROOT, logger as LOGGER
 from boxmot.utils.checks import RequirementsChecker
 
 
@@ -18,6 +18,7 @@ class BaseModelBackend:
         self.weights = weights[0] if isinstance(weights, list) else weights
         if isinstance(self.weights, str):
              self.weights = Path(self.weights)
+        self.weights = self.resolve_weights_path(self.weights)
         LOGGER.info(self.weights)
         self.device = device
         self.half = half
@@ -53,6 +54,28 @@ class BaseModelBackend:
         else: 
             input_shape = (256, 128)
         self.input_shape = input_shape
+
+    @staticmethod
+    def resolve_weights_path(weights: Path) -> Path:
+        """Prefer an existing local weights file before attempting any download."""
+        if weights.exists():
+            return weights
+
+        candidates = []
+        root_candidate = ROOT / weights.name
+        if root_candidate != weights:
+            candidates.append(root_candidate)
+
+        cwd_candidate = Path.cwd() / weights.name
+        if cwd_candidate != weights and cwd_candidate not in candidates:
+            candidates.append(cwd_candidate)
+
+        for candidate in candidates:
+            if candidate.exists():
+                LOGGER.info(f"Reusing local ReID weights from {candidate} instead of missing {weights}")
+                return candidate
+
+        return weights
 
     def get_crops(self, xyxys, img):
         h, w = img.shape[:2]

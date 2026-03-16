@@ -1,6 +1,7 @@
 # Mikel Broström 🔥 BoxMOT 🧾 AGPL-3.0 license
 
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,16 @@ from boxmot.utils.matching import (
     linear_assignment,
 )
 from boxmot.utils.ops import tlwh2xyah, xywh2tlwh, xywh2xyxy, xyxy2xywh
+
+
+@dataclass(frozen=True)
+class UnmatchedHighDecision:
+    """Explicit routing decision for one unmatched high-confidence detection."""
+
+    det_index: int
+    route: str
+    skip_confirmation: bool = False
+    birth_source: str = "unknown"
 
 
 class STrack(BaseTrack):
@@ -43,6 +54,9 @@ class STrack(BaseTrack):
         self.spatial_birth_frame = -1
         self.spatial_birth_point = None
         self.spatial_birth_committed = False
+        self.spatial_birth_trustworthy = False
+        self.spatial_birth_source = "unknown"
+        self.last_recovery_frame = -1
         if feat is not None:
             self.update_features(feat)
 
@@ -86,6 +100,7 @@ class STrack(BaseTrack):
         self.kalman_filter = kalman_filter
         self.id = self.next_id()
         self.mean, self.covariance = self.kalman_filter.initiate(self.xyah)
+        self.clear_lost_lifecycle_state()
 
         self.tracklet_len = 0
         self.state = TrackState.Tracked
@@ -99,12 +114,14 @@ class STrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.update(
             self.mean, self.covariance, new_track.xyah
         )
+        self.clear_lost_lifecycle_state()
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)
         self.tracklet_len = 0
         self.state = TrackState.Tracked
         self.is_activated = True
         self.frame_id = frame_id
+        self.last_recovery_frame = frame_id
         if new_id:
             self.id = self.next_id()
         self.conf = new_track.conf
@@ -126,6 +143,7 @@ class STrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.update(
             self.mean, self.covariance, new_track.xyah
         )
+        self.clear_lost_lifecycle_state()
         self.state = TrackState.Tracked
         self.is_activated = True
         if new_track.curr_feat is not None:
@@ -134,6 +152,12 @@ class STrack(BaseTrack):
         self.conf = new_track.conf
         self.cls = new_track.cls
         self.det_ind = new_track.det_ind
+
+    def clear_lost_lifecycle_state(self) -> None:
+        """Clear transient state that only applies while a track is lost or zombie."""
+        self.lost_frame_id = 0
+        self.frozen_mean = None
+        self.exit_pending = False
 
     def footpoint(self) -> np.ndarray:
         """Return the bottom-center point of the current track box."""
@@ -160,6 +184,14 @@ class STrack(BaseTrack):
         ret = xywh2xyxy(ret)
         return ret
 
+    def get_tlwh(self) -> np.ndarray:
+        """Return the current track box in tlwh format from the live KF state when available."""
+        if self.mean is not None:
+            ret = self.mean[:4].copy()
+            ret[2] *= ret[3]
+            return xywh2tlwh(ret)
+        return self.tlwh
+
     def get_tlwh_for_matching(self, frame_id: int = None, max_predict_frames: int = 5):
         """Get tlwh for matching, considering frozen state for zombie tracks.
 
@@ -183,11 +215,7 @@ class STrack(BaseTrack):
             return xywh2tlwh(ret)
 
         # Otherwise use current state (normal prediction)
-        if self.mean is not None:
-            ret = self.mean[:4].copy()
-            ret[2] *= ret[3]  # (xc, yc, a, h) -> (xc, yc, w, h)
-            return xywh2tlwh(ret)
-        return self.tlwh
+        return self.get_tlwh()
 
 
 class ByteTrack(BaseTracker):
@@ -306,6 +334,21 @@ class ByteTrack(BaseTracker):
         self.zombie_match_cost_thresh = float(kwargs.get("zombie_match_cost_thresh", 0.45))
         self.zombie_shape_max_ratio = float(kwargs.get("zombie_shape_max_ratio", 2.0))
         self.zombie_reid_min_box_area = float(kwargs.get("zombie_reid_min_box_area", 1024.0))
+        self.lost_reid_enabled = bool(kwargs.get("lost_reid_enabled", False))
+        self.lost_reid_weight = float(kwargs.get("lost_reid_weight", 0.70))
+        self.lost_motion_weight = float(kwargs.get("lost_motion_weight", 0.25))
+        self.lost_shape_weight = float(kwargs.get("lost_shape_weight", 0.05))
+        self.lost_reid_thresh = float(kwargs.get("lost_reid_thresh", 0.25))
+        self.lost_match_cost_thresh = float(kwargs.get("lost_match_cost_thresh", 0.35))
+        self.lost_shape_max_ratio = float(kwargs.get("lost_shape_max_ratio", 1.8))
+        self.lost_reid_min_box_area = float(kwargs.get("lost_reid_min_box_area", 1024.0))
+        default_lost_match_max_dist = min(
+            float(self.zombie_match_max_dist),
+            float(kwargs.get("zombie_dist_thresh", self.zombie_match_max_dist)),
+        )
+        self.lost_match_max_dist = float(kwargs.get("lost_match_max_dist", default_lost_match_max_dist))
+        default_lost_max_frames = min(max(1, int(self.track_buffer // 2)), 15)
+        self.lost_reid_max_frames = max(0, int(kwargs.get("lost_reid_max_frames", default_lost_max_frames)))
 
         # Soft birth gating (optional, disabled by default for backwards compatibility)
         self.birth_confirm_frames = max(1, int(kwargs.get('birth_confirm_frames', 1)))
@@ -324,9 +367,10 @@ class ByteTrack(BaseTracker):
         self.adaptive_zone_warmup = kwargs.get('adaptive_zone_warmup', 10)  # Number of frames to collect detections
         self.adaptive_zone_margin = kwargs.get('adaptive_zone_margin', 50)  # Margin within effective zone for entry
         self.adaptive_zone_padding = kwargs.get('adaptive_zone_padding', 1.2)  # Padding factor for effective zone
-        self.adaptive_zone_update_mode = kwargs.get('adaptive_zone_update_mode', 'always_expand')
-        self.adaptive_zone_expand_trigger = kwargs.get('adaptive_zone_expand_trigger', 'all_high')
+        self.adaptive_zone_update_mode = kwargs.get('adaptive_zone_update_mode', 'warmup_once')
+        self.adaptive_zone_expand_trigger = kwargs.get('adaptive_zone_expand_trigger', 'outside_high')
         self.adaptive_zone_min_box_area = kwargs.get('adaptive_zone_min_box_area', 0)
+        self.adaptive_zone_entry_mode = str(kwargs.get("adaptive_zone_entry_mode", "outside_only"))
 
         # Runtime state for adaptive zone
         self._warmup_detections = []  # Cache of detection boxes during warmup
@@ -359,6 +403,10 @@ class ByteTrack(BaseTracker):
         self.spatial_prior_entry_band_radius = max(0, int(kwargs.get('spatial_prior_entry_band_radius', 2)))
         self.spatial_prior_entry_support_threshold = int(kwargs.get('spatial_prior_entry_support_threshold', 100))
         self.spatial_prior_entry_birth_threshold = int(kwargs.get('spatial_prior_entry_birth_threshold', 8))
+        self.spatial_prior_entry_mode = str(kwargs.get("spatial_prior_entry_mode", "bias_only"))
+        self.spatial_prior_recovery_cooldown = max(
+            0, int(kwargs.get("spatial_prior_recovery_cooldown", 5))
+        )
         self.spatial_prior = (
             SpatialPriorField(
                 grid_w=self.spatial_prior_grid_w,
@@ -385,10 +433,17 @@ class ByteTrack(BaseTracker):
         """Return whether the passive spatial-prior learner is enabled."""
         return self.spatial_prior is not None
 
-    def _register_spatial_birth(self, track: STrack) -> None:
+    @staticmethod
+    def _spatial_birth_source_trustworthy(birth_source: str) -> bool:
+        """Only learn birth hotspots from conservative, geometry-backed birth sources."""
+        return birth_source in {"geometric_entry", "outside_expand"}
+
+    def _register_spatial_birth(self, track: STrack, birth_source: str = "unknown") -> None:
         """Attach provisional birth metadata to a newly activated track."""
         if not self._spatial_prior_active():
             return
+        track.spatial_birth_source = str(birth_source)
+        track.spatial_birth_trustworthy = self._spatial_birth_source_trustworthy(birth_source)
         track.spatial_birth_frame = self.frame_count
         if self.frame_count <= 1:
             track.spatial_birth_point = None
@@ -396,6 +451,16 @@ class ByteTrack(BaseTracker):
             return
         track.spatial_birth_point = track.footpoint()
         track.spatial_birth_committed = False
+
+    def _spatial_support_allowed(self, track: STrack, age: int) -> bool:
+        """Filter out unstable or recently recovered tracks before they can update the prior."""
+        if age < self.spatial_prior_support_min_age:
+            return False
+        if self.spatial_prior_recovery_cooldown <= 0:
+            return True
+        if getattr(track, "last_recovery_frame", -1) <= 0:
+            return True
+        return (self.frame_count - track.last_recovery_frame) >= self.spatial_prior_recovery_cooldown
 
     def _update_spatial_prior_tracks(self) -> None:
         """Update support counts and commit stabilized birth events."""
@@ -407,13 +472,13 @@ class ByteTrack(BaseTracker):
             if not track.is_activated or track.state != TrackState.Tracked:
                 continue
             age = max(1, self.frame_count - track.start_frame + 1)
-            if age >= self.spatial_prior_support_min_age:
+            if self._spatial_support_allowed(track, age):
                 support_points.append(track.footpoint())
             if track.spatial_birth_committed:
                 continue
             hits = track.tracklet_len + 1
             if age >= self.spatial_prior_birth_commit_age or hits >= self.spatial_prior_birth_commit_hits:
-                if track.spatial_birth_point is not None:
+                if track.spatial_birth_trustworthy and track.spatial_birth_point is not None:
                     birth_points.append(track.spatial_birth_point)
                 track.spatial_birth_committed = True
         if support_points:
@@ -640,21 +705,37 @@ class ByteTrack(BaseTracker):
         Returns:
             bool: True if the box is in the entry zone
         """
+        return self._get_entry_zone_info(tlwh, img_shape, margin=margin)["is_entry"]
+
+    def _get_entry_zone_info(self, tlwh, img_shape, margin=None) -> dict[str, str | bool | None]:
+        """Return whether a box is in entry zone and which mechanism granted that access."""
         if margin is None:
             margin = self.entry_margin
 
-        # Prefer explicit probability-field regions when they are available.
         x1, y1, w, h = tlwh
         x2, y2 = x1 + w, y1 + h
         point = np.array([(x1 + x2) * 0.5, y2], dtype=np.float32)
         region_label = self._get_spatial_region_label(point)
-        if region_label is not None:
-            return region_label == "entry"
+        rect_entry = self._is_in_rect_entry_zone(tlwh, img_shape, margin=margin)
+        if region_label == "entry":
+            return {"is_entry": True, "source": "spatial_entry", "region_label": region_label}
+        if region_label == "core" and self.spatial_prior_entry_mode == "strict_region":
+            return {"is_entry": False, "source": None, "region_label": region_label}
+        if rect_entry:
+            return {"is_entry": True, "source": "geometric_entry", "region_label": region_label}
+        return {"is_entry": False, "source": None, "region_label": region_label}
+
+    def _is_in_rect_entry_zone(self, tlwh, img_shape, margin=None) -> bool:
+        """Check the geometric/adaptive entry zone without spatial-prior override."""
+        if margin is None:
+            margin = self.entry_margin
 
         # If entry_margin is 0, consider everything as entry zone (disabled gating)
         if margin <= 0:
             return True
 
+        x1, y1, w, h = tlwh
+        x2, y2 = x1 + w, y1 + h
         img_h, img_w = img_shape[0], img_shape[1]
 
         # Fixed margin mode (original behavior)
@@ -672,6 +753,9 @@ class ByteTrack(BaseTracker):
         # If box is outside effective zone, it's in entry zone
         if x2 < ex1 or x1 > ex2 or y2 < ey1 or y1 > ey2:
             return True
+
+        if self.adaptive_zone_entry_mode == "outside_only":
+            return False
 
         # If box is inside effective zone, check margin within effective zone
         margin = self.adaptive_zone_margin
@@ -929,6 +1013,31 @@ class ByteTrack(BaseTracker):
         """Return True when the tracker can perform appearance-based zombie rescue."""
         return bool(self.zombie_reid_enabled and self.with_reid)
 
+    def _lost_reid_ready(self) -> bool:
+        """Return True when the tracker can run appearance-assisted recent-lost recovery."""
+        return bool(self.lost_reid_enabled and self.with_reid and self.lost_reid_max_frames > 0)
+
+    @staticmethod
+    def _stack_track_features(tracks: list[STrack]) -> np.ndarray | None:
+        """Stack normalized smooth/current features, returning None when features are unavailable."""
+        if not tracks:
+            return None
+        features = []
+        feature_dim = None
+        for track in tracks:
+            feat = track.smooth_feat if track.smooth_feat is not None else track.curr_feat
+            if feat is None:
+                return None
+            feat = np.asarray(feat, dtype=np.float32).reshape(-1)
+            if feature_dim is None:
+                feature_dim = feat.shape[0]
+                if feature_dim == 0:
+                    return None
+            elif feat.shape[0] != feature_dim:
+                return None
+            features.append(feat)
+        return np.vstack(features)
+
     def _build_zombie_match_cost(
         self,
         detection_tracks: list[STrack],
@@ -1017,6 +1126,68 @@ class ByteTrack(BaseTracker):
 
         return cost_matrix
 
+    def _build_lost_match_cost(
+        self,
+        detection_tracks: list[STrack],
+        lost_stracks: list[STrack],
+        max_dist: float,
+    ) -> np.ndarray:
+        """Build a gated cost matrix for recent lost-track recovery."""
+        invalid_cost = self.lost_match_cost_thresh + 1.0
+        cost_matrix = np.full(
+            (len(lost_stracks), len(detection_tracks)),
+            invalid_cost,
+            dtype=np.float32,
+        )
+        if cost_matrix.size == 0 or not self._lost_reid_ready():
+            return cost_matrix
+
+        lost_features = self._stack_track_features(lost_stracks)
+        det_features = self._stack_track_features(detection_tracks)
+        if lost_features is None or det_features is None:
+            return cost_matrix
+
+        emb_cost = 1.0 - np.clip(lost_features @ det_features.T, -1.0, 1.0)
+        weight_sum = max(
+            self.lost_reid_weight + self.lost_motion_weight + self.lost_shape_weight,
+            1e-6,
+        )
+
+        for ilost, lost_track in enumerate(lost_stracks):
+            lost_tlwh = lost_track.get_tlwh_for_matching(
+                frame_id=self.frame_count,
+                max_predict_frames=self.zombie_max_predict_frames,
+            )
+            for idet, det_track in enumerate(detection_tracks):
+                det_tlwh = det_track.tlwh
+                det_area = float(det_tlwh[2] * det_tlwh[3])
+                if det_area < self.lost_reid_min_box_area:
+                    continue
+
+                dist = self._calculate_center_distance(det_tlwh, lost_tlwh)
+                if dist > max_dist:
+                    continue
+
+                width_ratio = max(det_tlwh[2], lost_tlwh[2]) / max(min(det_tlwh[2], lost_tlwh[2]), 1e-6)
+                height_ratio = max(det_tlwh[3], lost_tlwh[3]) / max(min(det_tlwh[3], lost_tlwh[3]), 1e-6)
+                if max(width_ratio, height_ratio) > self.lost_shape_max_ratio:
+                    continue
+
+                reid_cost = float(emb_cost[ilost, idet])
+                if reid_cost > self.lost_reid_thresh:
+                    continue
+
+                motion_cost = min(1.0, dist / max(max_dist, 1e-6))
+                shape_cost = self._calculate_shape_cost(det_tlwh, lost_tlwh)
+                total_cost = (
+                    self.lost_reid_weight * reid_cost
+                    + self.lost_motion_weight * motion_cost
+                    + self.lost_shape_weight * shape_cost
+                ) / weight_sum
+                cost_matrix[ilost, idet] = total_cost
+
+        return cost_matrix
+
     def _match_zombie_tracks(
         self,
         detection_tracks: list[STrack],
@@ -1039,6 +1210,43 @@ class ByteTrack(BaseTracker):
             det_track = detection_tracks[idet]
             zombie.re_activate(det_track, self.frame_count, new_id=False)
             matched_pairs.append((int(idet), zombie))
+        return matched_pairs, tuple(int(i) for i in unmatched_dets)
+
+    def _match_recent_lost_tracks(
+        self,
+        detection_tracks: list[STrack],
+        lost_stracks: list[STrack],
+    ):
+        """Recover recent lost tracks before routing unmatched center detections to zombie/new birth."""
+        if not detection_tracks or not lost_stracks or not self._lost_reid_ready():
+            return [], tuple(range(len(detection_tracks)))
+
+        recent_lost = []
+        for track in lost_stracks:
+            if track.state != TrackState.Lost:
+                continue
+            frames_lost = self.frame_count - track.lost_frame_id
+            if frames_lost < 0 or frames_lost > self.lost_reid_max_frames:
+                continue
+            recent_lost.append(track)
+        if not recent_lost:
+            return [], tuple(range(len(detection_tracks)))
+
+        cost_matrix = self._build_lost_match_cost(
+            detection_tracks,
+            recent_lost,
+            max_dist=self.lost_match_max_dist,
+        )
+        matches, _, unmatched_dets = linear_assignment(
+            cost_matrix,
+            thresh=self.lost_match_cost_thresh,
+        )
+        matched_pairs = []
+        for ilost, idet in matches:
+            lost_track = recent_lost[ilost]
+            det_track = detection_tracks[idet]
+            lost_track.re_activate(det_track, self.frame_count, new_id=False)
+            matched_pairs.append((int(idet), lost_track))
         return matched_pairs, tuple(int(i) for i in unmatched_dets)
 
     def _try_match_zombie(self, detection, zombie_stracks, max_dist=None):
@@ -1135,13 +1343,14 @@ class ByteTrack(BaseTracker):
         activated_starcks,
         reference_tracks,
         skip_confirmation: bool = False,
+        birth_source: str = "unknown",
     ):
         """Apply duplicate suppression and optional temporal confirmation before spawning a new ID."""
         if skip_confirmation or self.birth_confirm_frames <= 1:
             if self._is_birth_suppressed(det_track, reference_tracks):
                 return False
             det_track.activate(self.kalman_filter, self.frame_count)
-            self._register_spatial_birth(det_track)
+            self._register_spatial_birth(det_track, birth_source=birth_source)
             self._set_exit_pending(det_track, False)
             activated_starcks.append(det_track)
             return True
@@ -1163,7 +1372,7 @@ class ByteTrack(BaseTracker):
         hits = pending["hits"] + 1
         if hits >= self.birth_confirm_frames:
             det_track.activate(self.kalman_filter, self.frame_count)
-            self._register_spatial_birth(det_track)
+            self._register_spatial_birth(det_track, birth_source=birth_source)
             self._set_exit_pending(det_track, False)
             activated_starcks.append(det_track)
             return True
@@ -1173,6 +1382,67 @@ class ByteTrack(BaseTracker):
         pending["last_frame"] = self.frame_count
         self.pending_births.append(pending)
         return False
+
+    def _classify_unmatched_high_detection(
+        self,
+        det_track: STrack,
+        img_shape,
+    ) -> UnmatchedHighDecision | None:
+        """Route one unmatched high-confidence detection into birth or old-id recovery flow."""
+        if det_track.conf < self.new_track_thresh:
+            return None
+
+        if (
+            self.adaptive_zone_enabled
+            and self.adaptive_zone_update_mode == 'always_expand'
+            and self.adaptive_zone_expand_trigger in ('unmatched_high', 'outside_high')
+        ):
+            self._update_effective_zone([det_track], phase='step4')
+
+        if (
+            self.adaptive_zone_enabled
+            and self.adaptive_zone_update_mode == 'always_expand'
+            and int(det_track.det_ind) in self._outside_zone_det_inds
+        ):
+            return UnmatchedHighDecision(
+                det_index=int(det_track.det_ind),
+                route="birth",
+                skip_confirmation=False,
+                birth_source="outside_expand",
+            )
+
+        entry_info = self._get_entry_zone_info(det_track.tlwh, img_shape)
+        if bool(entry_info["is_entry"]):
+            return UnmatchedHighDecision(
+                det_index=int(det_track.det_ind),
+                route="birth",
+                skip_confirmation=True,
+                birth_source=str(entry_info["source"] or "unknown"),
+            )
+
+        if self.strict_entry_gate and self.entry_margin > 0:
+            return UnmatchedHighDecision(
+                det_index=int(det_track.det_ind),
+                route="recover_then_block",
+            )
+
+        return UnmatchedHighDecision(
+            det_index=int(det_track.det_ind),
+            route="recover_then_birth",
+        )
+
+    def _classify_unmatched_high_detections(
+        self,
+        detection_tracks: list[STrack],
+        img_shape,
+    ) -> list[UnmatchedHighDecision]:
+        """Build routing decisions for all unmatched high-confidence detections."""
+        decisions = []
+        for det_track in detection_tracks:
+            decision = self._classify_unmatched_high_detection(det_track, img_shape)
+            if decision is not None:
+                decisions.append(decision)
+        return decisions
 
     @BaseTracker.setup_decorator
     @BaseTracker.per_class_decorator
@@ -1306,7 +1576,7 @@ class ByteTrack(BaseTracker):
             if not track.state == TrackState.Lost:
                 # Check exit zone: mark exit-pending for delayed removal after grace frames
                 if self.exit_zone_enabled:
-                    track_tlwh = track.tlwh
+                    track_tlwh = track.get_tlwh()
                     in_exit_zone = self._is_in_exit_zone(track_tlwh, current_img_shape)
                     if in_exit_zone:
                         self._set_exit_pending(track, True)
@@ -1350,48 +1620,26 @@ class ByteTrack(BaseTracker):
                 if det_track.conf < self.new_track_thresh:
                     continue
                 det_track.activate(self.kalman_filter, self.frame_count)
-                self._register_spatial_birth(det_track)
+                self._register_spatial_birth(det_track, birth_source="frame1")
                 activated_starcks.append(det_track)
         else:
             # Normal frames: process unmatched detections
+            unmatched_high_detections = [detections[inew] for inew in u_detection]
+            decision_by_det_ind = {
+                decision.det_index: decision
+                for decision in self._classify_unmatched_high_detections(
+                    unmatched_high_detections,
+                    current_img_shape,
+                )
+            }
             center_zone_detections = []
-            for inew in u_detection:
-                det_track = detections[inew]
-                if det_track.conf < self.new_track_thresh:
+            recovery_decisions = []
+
+            for det_track in unmatched_high_detections:
+                decision = decision_by_det_ind.get(int(det_track.det_ind))
+                if decision is None:
                     continue
-
-                # In always_expand mode, unmatched-high trigger can expand zone in step4.
-                if (
-                    self.adaptive_zone_enabled
-                    and self.adaptive_zone_update_mode == 'always_expand'
-                    and self.adaptive_zone_expand_trigger in ('unmatched_high', 'outside_high')
-                ):
-                    self._update_effective_zone([det_track], phase='step4')
-
-                # If this detection was outside effective zone before expansion this frame,
-                # allow immediate ID creation (newly entered or newly visible region).
-                if (
-                    self.adaptive_zone_enabled
-                    and self.adaptive_zone_update_mode == 'always_expand'
-                    and int(det_track.det_ind) in self._outside_zone_det_inds
-                ):
-                    birth_refs = self._collect_birth_reference_tracks(
-                        self.active_tracks,
-                        self.lost_stracks,
-                        self.zombie_stracks,
-                        activated_starcks,
-                        refind_stracks,
-                        lost_stracks,
-                    )
-                    self._try_activate_new_track(det_track, activated_starcks, birth_refs)
-                    continue
-
-                det_tlwh = det_track.tlwh
-                is_entry = self._is_in_entry_zone(det_tlwh, current_img_shape)
-                if is_entry:
-                    # Entry-zone births use original ByteTrack activation semantics:
-                    # activate immediately, then let the usual unconfirmed stage decide
-                    # whether the track stabilizes on the next frame.
+                if decision.route == "birth":
                     birth_refs = self._collect_birth_reference_tracks(
                         self.active_tracks,
                         self.lost_stracks,
@@ -1404,24 +1652,47 @@ class ByteTrack(BaseTracker):
                         det_track,
                         activated_starcks,
                         birth_refs,
-                        skip_confirmation=True,
+                        skip_confirmation=decision.skip_confirmation,
+                        birth_source=decision.birth_source,
                     )
-                else:
-                    center_zone_detections.append(det_track)
+                    continue
+                center_zone_detections.append(det_track)
+                recovery_decisions.append(decision)
 
             unmatched_center_zone = tuple(range(len(center_zone_detections)))
             if center_zone_detections:
-                matched_pairs, unmatched_center_zone = self._match_zombie_tracks(
+                recent_lost_candidates = joint_stracks(self.lost_stracks, lost_stracks)
+                recent_lost_candidates = sub_stracks(recent_lost_candidates, refind_stracks)
+                lost_pairs, unmatched_center_zone = self._match_recent_lost_tracks(
                     center_zone_detections,
+                    recent_lost_candidates,
+                )
+                for _, lost_track in lost_pairs:
+                    refind_stracks.append(lost_track)
+
+            if center_zone_detections and unmatched_center_zone:
+                prev_unmatched_center_zone = unmatched_center_zone
+                remaining_center_zone = [
+                    center_zone_detections[i] for i in unmatched_center_zone
+                ]
+                matched_pairs, unmatched_center_zone = self._match_zombie_tracks(
+                    remaining_center_zone,
                     self.zombie_stracks,
                 )
                 for _, zombie in matched_pairs:
                     refind_stracks.append(zombie)
                     rescued_zombies.append(zombie)
+                unmatched_center_zone = tuple(
+                    prev_unmatched_center_zone[i] for i in unmatched_center_zone
+                )
 
+            decision_by_center_idx = {
+                idx: decision for idx, decision in enumerate(recovery_decisions)
+            }
             for local_idx in unmatched_center_zone:
                 det_track = center_zone_detections[local_idx]
-                if self.strict_entry_gate and self.entry_margin > 0:
+                decision = decision_by_center_idx[local_idx]
+                if decision.route == "recover_then_block":
                     continue
                 birth_refs = self._collect_birth_reference_tracks(
                     self.active_tracks,
@@ -1431,7 +1702,12 @@ class ByteTrack(BaseTracker):
                     refind_stracks,
                     lost_stracks,
                 )
-                self._try_activate_new_track(det_track, activated_starcks, birth_refs)
+                self._try_activate_new_track(
+                    det_track,
+                    activated_starcks,
+                    birth_refs,
+                    birth_source="center_birth",
+                )
 
         """ Step 5: Update lost tracks and transition to zombie """
         # Add newly lost tracks to self.lost_stracks
