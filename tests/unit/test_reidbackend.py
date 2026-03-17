@@ -1,8 +1,10 @@
 import cv2
 import numpy as np
 import pytest
+from pathlib import Path
 
 from boxmot.reid.backends.onnx_backend import ONNXBackend
+from boxmot.reid.backends.base_backend import BaseModelBackend
 from boxmot.reid.backends.openvino_backend import OpenVinoBackend
 from boxmot.reid.backends.pytorch_backend import PyTorchBackend
 from boxmot.reid.backends.torchscript_backend import TorchscriptBackend
@@ -51,3 +53,16 @@ def test_reidbackend_type(exported_reid_model, backend):
     b = rab.get_backend()
 
     assert isinstance(b, backend)
+
+
+def test_reidbackend_resolves_existing_root_weights_before_download(tmp_path, monkeypatch):
+    local_root_weight = ROOT / "osnet_x0_25_msmt17.pt"
+    if not local_root_weight.exists():
+        pytest.skip(f"Expected local weight not found: {local_root_weight}")
+
+    monkeypatch.chdir(tmp_path)
+    missing_engine_weight = tmp_path / "boxmot" / "engine" / "weights" / "osnet_x0_25_msmt17.pt"
+
+    resolved = BaseModelBackend.resolve_weights_path(missing_engine_weight)
+
+    assert resolved == local_root_weight

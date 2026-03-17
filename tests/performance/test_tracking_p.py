@@ -11,6 +11,8 @@ from tests.test_config import (
     MOTION_ONLY_TRACKING_NAMES,
 )
 
+REID_TEST_WEIGHTS = WEIGHTS / "osnet_x0_25_msmt17.pt"
+
 
 @pytest.mark.parametrize("tracker_type", MOTION_ONLY_TRACKING_NAMES)
 def test_motion_tracker_update_time(tracker_type):
@@ -18,7 +20,7 @@ def test_motion_tracker_update_time(tracker_type):
     tracker = create_tracker(
         tracker_type=tracker_type,
         tracker_config=tracker_conf,
-        reid_weights=WEIGHTS / "mobilenetv2_x1_4_dukemtmcreid.pt",
+        reid_weights=REID_TEST_WEIGHTS,
         device="cpu",
         half=False,
         per_class=False,
@@ -64,7 +66,7 @@ def test_motion_n_appearance_tracker_update_time(tracker_type):
     tracker = create_tracker(
         tracker_type=tracker_type,
         tracker_config=tracker_conf,
-        reid_weights=WEIGHTS / "mobilenetv2_x1_4_dukemtmcreid.pt",
+        reid_weights=REID_TEST_WEIGHTS,
         device="cpu",
         half=False,
         per_class=False,

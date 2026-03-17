@@ -12,7 +12,7 @@ from boxmot import (
 from boxmot.trackers.deepocsort.deepocsort import (
     KalmanBoxTracker as DeepOCSortKalmanBoxTracker,
 )
-from boxmot.trackers.bytetrack.bytetrack import ByteTrack
+from boxmot.trackers.bytetrack.bytetrack import ByteTrack, STrack
 from boxmot.trackers.bytetrack.spatial_prior import SpatialPriorField
 from boxmot.trackers.ocsort.ocsort import KalmanBoxTracker as OCSortKalmanBoxTracker
 from boxmot.utils import WEIGHTS
@@ -24,13 +24,29 @@ from tests.test_config import (
     PER_CLASS_TRACKERS,
 )
 
+REID_TEST_WEIGHTS = WEIGHTS / "osnet_x0_25_msmt17.pt"
+
 # --- existing tests ---
+
+
+def _update_tracker_until_output(tracker, det, rgb, tracker_type: str, max_frames: int = 4):
+    """Drive trackers that require multiple hits before returning confirmed outputs."""
+    if tracker_type in MOTION_N_APPEARANCE_TRACKING_NAMES:
+        embs = np.random.rand(len(det), 512)
+        run_update = lambda: tracker.update(det, rgb, embs)
+    else:
+        run_update = lambda: tracker.update(det, rgb)
+
+    outputs = []
+    for _ in range(max_frames):
+        outputs.append(run_update())
+    return outputs
 
 
 @pytest.mark.parametrize("Tracker", MOTION_N_APPEARANCE_TRACKING_METHODS)
 def test_motion_n_appearance_trackers_instantiation(Tracker):
     Tracker(
-        reid_weights=Path(WEIGHTS / "osnet_x0_25_msmt17.pt"),
+        reid_weights=Path(REID_TEST_WEIGHTS),
         device="cpu",
         half=True,
     )
@@ -47,7 +63,7 @@ def test_tracker_output_size(tracker_type):
     tracker = create_tracker(
         tracker_type=tracker_type,
         tracker_config=tracker_conf,
-        reid_weights=WEIGHTS / "mobilenetv2_x1_4_dukemtmcreid.pt",
+        reid_weights=REID_TEST_WEIGHTS,
         device="cpu",
         half=False,
         per_class=False,
@@ -56,8 +72,8 @@ def test_tracker_output_size(tracker_type):
     rgb = np.random.randint(255, size=(640, 640, 3), dtype=np.uint8)
     det = np.array([[144, 212, 400, 480, 0.82, 0], [425, 281, 576, 472, 0.72, 65]])
 
-    output = tracker.update(det, rgb)
-    assert output.shape == (2, 8)
+    outputs = _update_tracker_until_output(tracker, det, rgb, tracker_type)
+    assert outputs[-1].shape == (2, 8)
 
 
 def test_dynamic_max_obs_based_on_max_age():
@@ -96,7 +112,7 @@ TRACKER_CREATORS = {
         (
             DeepOcSort,
             {
-                "reid_weights": Path(WEIGHTS / "osnet_x0_25_msmt17.pt"),
+                "reid_weights": Path(REID_TEST_WEIGHTS),
                 "device": "cpu",
                 "half": True,
             },
@@ -125,7 +141,7 @@ def test_per_class_tracker_output_size(tracker_type):
     tracker = create_tracker(
         tracker_type=tracker_type,
         tracker_config=tracker_conf,
-        reid_weights=WEIGHTS / "mobilenetv2_x1_4_dukemtmcreid.pt",
+        reid_weights=REID_TEST_WEIGHTS,
         device="cpu",
         half=False,
         per_class=True,
@@ -149,7 +165,7 @@ def test_per_class_tracker_active_tracks(tracker_type):
     tracker = create_tracker(
         tracker_type=tracker_type,
         tracker_config=tracker_conf,
-        reid_weights=WEIGHTS / "mobilenetv2_x1_4_dukemtmcreid.pt",
+        reid_weights=REID_TEST_WEIGHTS,
         device="cpu",
         half=False,
         per_class=True,
@@ -174,7 +190,7 @@ def test_tracker_with_no_detections(tracker_type, dets):
     tracker = create_tracker(
         tracker_type=tracker_type,
         tracker_config=tracker_conf,
-        reid_weights=WEIGHTS / "mobilenetv2_x1_4_dukemtmcreid.pt",
+        reid_weights=REID_TEST_WEIGHTS,
         device="cpu",
         half=False,
         per_class=False,
@@ -192,7 +208,7 @@ def test_per_class_isolation(tracker_type):
     tracker = create_tracker(
         tracker_type,
         get_tracker_config(tracker_type),
-        WEIGHTS / "mobilenetv2_x1_4_dukemtmcreid.pt",
+        REID_TEST_WEIGHTS,
         device="cpu",
         half=False,
         per_class=True,
@@ -216,7 +232,7 @@ def test_emb_trackers_requires_embeddings(tracker_type):
     tracker = create_tracker(
         tracker_type=tracker_type,
         tracker_config=tracker_conf,
-        reid_weights=WEIGHTS / "mobilenetv2_x1_4_dukemtmcreid.pt",
+        reid_weights=REID_TEST_WEIGHTS,
         device="cpu",
         half=False,
         per_class=False,
@@ -232,7 +248,7 @@ def test_invalid_det_array_shape(tracker_type):
     tracker = create_tracker(
         tracker_type,
         get_tracker_config(tracker_type),
-        WEIGHTS / "mobilenetv2_x1_4_dukemtmcreid.pt",
+        REID_TEST_WEIGHTS,
         device="cpu",
         half=False,
         per_class=False,
@@ -260,7 +276,7 @@ def test_track_id_stable_over_frames(tracker_type):
     tracker = create_tracker(
         tracker_type=tracker_type,
         tracker_config=cfg,
-        reid_weights=WEIGHTS / "mobilenetv2_x1_4_dukemtmcreid.pt",
+        reid_weights=REID_TEST_WEIGHTS,
         device="cpu",
         half=False,
         per_class=False,
@@ -269,16 +285,11 @@ def test_track_id_stable_over_frames(tracker_type):
     det = np.array([[50, 50, 100, 100, 0.95, 3]])
     rgb = np.zeros((640, 640, 3), dtype=np.uint8)
 
-    # choose embedding only if needed
-    if tracker_type in MOTION_N_APPEARANCE_TRACKING_NAMES:
-        embs = np.random.rand(1, 512)
-        out1 = tracker.update(det, rgb, embs)
-        out2 = tracker.update(det, rgb, embs)
-    else:
-        out1 = tracker.update(det, rgb)
-        out2 = tracker.update(det, rgb)
+    outputs = _update_tracker_until_output(tracker, det, rgb, tracker_type)
+    non_empty_outputs = [out for out in outputs if out.shape == (1, 8)]
 
-    assert out1.shape == out2.shape == (1, 8), "Unexpected output shape"
+    assert len(non_empty_outputs) >= 2, "Unexpected output shape"
+    out1, out2 = non_empty_outputs[-2], non_empty_outputs[-1]
     # track ID is at column 1
     assert out1[0, 4] == out2[0, 4], "Track ID should remain the same across frames"
 
@@ -289,7 +300,7 @@ def test_create_tracker_invalid_tracker_name():
         create_tracker(
             tracker_type="nonexistent_tracker",
             tracker_config=get_tracker_config("botsort"),
-            reid_weights=WEIGHTS / "mobilenetv2_x1_4_dukemtmcreid.pt",
+            reid_weights=REID_TEST_WEIGHTS,
             device="cpu",
             half=False,
             per_class=False,
@@ -357,6 +368,48 @@ def test_bytetrack_outside_before_expand_keeps_new_id_creation():
     assert id3 != id1
 
 
+def test_bytetrack_adaptive_zone_outside_only_does_not_turn_inner_margin_into_entry():
+    tracker = ByteTrack(
+        entry_margin=50,
+        strict_entry_gate=True,
+        adaptive_zone_enabled=True,
+        adaptive_zone_update_mode="warmup_once",
+        adaptive_zone_entry_mode="outside_only",
+        adaptive_zone_padding=1.0,
+        adaptive_zone_warmup=1,
+        zombie_max_history=0,
+    )
+    img = np.zeros((1000, 1000, 3), dtype=np.uint8)
+    det = np.array([[100, 100, 160, 220, 0.95, 0]], dtype=np.float32)
+
+    tracker.update(det, img)
+    assert tracker._effective_zone is not None
+    inside_margin_box = np.array([110, 110, 50, 80], dtype=np.float32)
+    assert not tracker._is_outside_effective_zone(inside_margin_box)
+    assert tracker._is_in_entry_zone(inside_margin_box, img.shape[:2]) is False
+
+
+def test_bytetrack_adaptive_zone_margin_inside_mode_preserves_inner_margin_entry():
+    tracker = ByteTrack(
+        entry_margin=50,
+        strict_entry_gate=True,
+        adaptive_zone_enabled=True,
+        adaptive_zone_update_mode="warmup_once",
+        adaptive_zone_entry_mode="margin_inside",
+        adaptive_zone_padding=1.0,
+        adaptive_zone_warmup=1,
+        adaptive_zone_margin=20,
+        zombie_max_history=0,
+    )
+    img = np.zeros((1000, 1000, 3), dtype=np.uint8)
+    det = np.array([[100, 100, 160, 220, 0.95, 0]], dtype=np.float32)
+
+    tracker.update(det, img)
+    inside_margin_box = np.array([110, 110, 50, 80], dtype=np.float32)
+    assert not tracker._is_outside_effective_zone(inside_margin_box)
+    assert tracker._is_in_entry_zone(inside_margin_box, img.shape[:2]) is True
+
+
 def test_bytetrack_entry_zone_birth_skips_pending_confirmation():
     tracker = ByteTrack(
         new_track_thresh=0.6,
@@ -414,6 +467,30 @@ def test_bytetrack_exit_zone_remove_grace_delays_removal():
     tracker.update(empty, img)
     tracker.update(empty, img)
     assert len(tracker.removed_stracks) >= 1
+
+
+def test_bytetrack_exit_zone_uses_current_track_state_not_stale_init_tlwh():
+    tracker = ByteTrack(
+        entry_margin=0,
+        strict_entry_gate=False,
+        exit_zone_enabled=True,
+        exit_zone_margin=50,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    edge_det = np.array([[5, 120, 65, 240, 0.95, 0]], dtype=np.float32)
+    empty = np.empty((0, 6), dtype=np.float32)
+
+    tracker.update(edge_det, img)
+    assert len(tracker.active_tracks) == 1
+
+    track = tracker.active_tracks[0]
+    track.mean[:4] = np.array([320.0, 280.0, 0.5, 120.0], dtype=np.float32)
+
+    tracker.update(empty, img)
+    assert len(tracker.lost_stracks) == 1
+    assert bool(getattr(tracker.lost_stracks[0], "exit_pending", False)) is False
 
 
 def test_bytetrack_new_track_thresh_blocks_low_conf_birth():
@@ -505,7 +582,7 @@ def test_bytetrack_pending_birth_expires_without_consecutive_confirmation():
     tracker = ByteTrack(
         new_track_thresh=0.6,
         birth_confirm_frames=2,
-        entry_margin=0,
+        entry_margin=50,
         strict_entry_gate=False,
         adaptive_zone_enabled=False,
         zombie_max_history=0,
@@ -522,6 +599,51 @@ def test_bytetrack_pending_birth_expires_without_consecutive_confirmation():
     tracker.update(det, img)
     assert len(tracker.pending_births) == 1
     assert len(tracker.active_tracks) == 0
+
+
+@pytest.mark.parametrize(
+    ("strict_entry_gate", "expected_route"),
+    [
+        (True, "recover_then_block"),
+        (False, "recover_then_birth"),
+    ],
+)
+def test_bytetrack_classifies_center_unmatched_high_consistently(strict_entry_gate, expected_route):
+    tracker = ByteTrack(
+        entry_margin=50,
+        strict_entry_gate=strict_entry_gate,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+    )
+    det = STrack(
+        np.array([220, 120, 280, 280, 0.95, 0, 0], dtype=np.float32),
+        max_obs=tracker.max_obs,
+    )
+
+    decision = tracker._classify_unmatched_high_detection(det, (640, 640))
+
+    assert decision is not None
+    assert decision.route == expected_route
+    assert decision.skip_confirmation is False
+
+
+def test_bytetrack_classifies_entry_detection_as_immediate_birth():
+    tracker = ByteTrack(
+        entry_margin=50,
+        strict_entry_gate=True,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+    )
+    det = STrack(
+        np.array([5, 120, 65, 280, 0.95, 0, 0], dtype=np.float32),
+        max_obs=tracker.max_obs,
+    )
+
+    decision = tracker._classify_unmatched_high_detection(det, (640, 640))
+
+    assert decision is not None
+    assert decision.route == "birth"
+    assert decision.skip_confirmation is True
 
 
 def _make_reid_ready_bytetrack(**kwargs) -> ByteTrack:
@@ -628,6 +750,80 @@ def test_bytetrack_zombie_reid_gate_blocks_wrong_appearance_rescue():
     assert out4.size == 0
     assert len(tracker.active_tracks) == 0
     assert len(tracker.zombie_stracks) == 1
+
+
+def test_bytetrack_recent_lost_reid_recovers_center_unmatched_high_before_zombie():
+    tracker = _make_reid_ready_bytetrack(
+        entry_margin=50,
+        strict_entry_gate=True,
+        adaptive_zone_enabled=False,
+        zombie_max_history=10,
+        zombie_transition_frames=30,
+        zombie_match_max_dist=120,
+        zombie_dist_thresh=120,
+        lost_reid_enabled=True,
+        lost_match_max_dist=120,
+        lost_reid_max_frames=5,
+        lost_reid_thresh=0.2,
+        lost_match_cost_thresh=0.35,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    empty = np.empty((0, 6), dtype=np.float32)
+
+    det = np.array([[240, 120, 300, 280, 0.95, 0]], dtype=np.float32)
+    emb = np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+
+    out1 = tracker.update(det, img, emb)
+    assert out1.shape[0] == 1
+    track_id = int(out1[0, 4])
+
+    tracker.update(empty, img)
+    assert len(tracker.lost_stracks) == 1
+    assert len(tracker.zombie_stracks) == 0
+
+    shifted_det = np.array([[330, 120, 390, 280, 0.95, 0]], dtype=np.float32)
+    out3 = tracker.update(shifted_det, img, emb)
+    assert out3.shape[0] == 1
+    assert int(out3[0, 4]) == track_id
+    assert len(tracker.zombie_stracks) == 0
+
+
+def test_bytetrack_recent_lost_reid_blocks_wrong_appearance():
+    tracker = _make_reid_ready_bytetrack(
+        entry_margin=50,
+        strict_entry_gate=True,
+        adaptive_zone_enabled=False,
+        zombie_max_history=10,
+        zombie_transition_frames=30,
+        zombie_match_max_dist=120,
+        zombie_dist_thresh=120,
+        lost_reid_enabled=True,
+        lost_match_max_dist=120,
+        lost_reid_max_frames=5,
+        lost_reid_thresh=0.2,
+        lost_match_cost_thresh=0.35,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    empty = np.empty((0, 6), dtype=np.float32)
+
+    det = np.array([[240, 120, 300, 280, 0.95, 0]], dtype=np.float32)
+    emb = np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+
+    out1 = tracker.update(det, img, emb)
+    assert out1.shape[0] == 1
+
+    tracker.update(empty, img)
+    assert len(tracker.lost_stracks) == 1
+    assert len(tracker.zombie_stracks) == 0
+
+    wrong_det = np.array([[330, 120, 390, 280, 0.95, 0]], dtype=np.float32)
+    wrong_emb = np.array([[0.0, 1.0, 0.0, 0.0]], dtype=np.float32)
+
+    out3 = tracker.update(wrong_det, img, wrong_emb)
+    assert out3.size == 0
+    assert len(tracker.active_tracks) == 0
+    assert len(tracker.lost_stracks) == 1
+    assert len(tracker.zombie_stracks) == 0
 
 
 def test_bytetrack_spatial_prior_commits_stable_birth_and_support():
@@ -967,6 +1163,92 @@ def test_bytetrack_spatial_region_core_is_not_entry():
     assert tracker._is_in_entry_zone(np.array([290, 240, 60, 80], dtype=np.float32), img.shape[:2]) is False
 
 
+def test_bytetrack_spatial_core_bias_does_not_block_geometric_edge_entry():
+    tracker = ByteTrack(
+        entry_margin=50,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_region_enabled=True,
+        spatial_prior_entry_mode="bias_only",
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    edge_box = np.array([10, 240, 60, 80], dtype=np.float32)
+
+    tracker.update(np.empty((0, 6), dtype=np.float32), img)
+    tracker.spatial_entry_mask = np.zeros_like(tracker.spatial_prior.support_count, dtype=bool)
+    tracker.spatial_core_mask = np.zeros_like(tracker.spatial_prior.support_count, dtype=bool)
+    point = np.array([edge_box[0] + edge_box[2] * 0.5, edge_box[1] + edge_box[3]], dtype=np.float32)
+    ix, iy = tracker.spatial_prior.point_to_index(point)
+    tracker.spatial_core_mask[iy, ix] = True
+    tracker._spatial_region_dirty = False
+
+    assert tracker._get_spatial_region_label(point) == "core"
+    assert tracker._is_in_entry_zone(edge_box, img.shape[:2]) is True
+
+
+def test_bytetrack_spatial_prior_does_not_learn_birth_from_spatial_override():
+    tracker = ByteTrack(
+        entry_margin=50,
+        strict_entry_gate=True,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_region_enabled=True,
+        spatial_prior_decay=1.0,
+        spatial_prior_region_conf=0.1,
+        spatial_prior_region_walk=0.0,
+        spatial_prior_region_birth=0.0,
+        spatial_prior_entry_band_radius=0,
+        spatial_prior_entry_support_threshold=1,
+        spatial_prior_entry_birth_threshold=1,
+        spatial_prior_birth_commit_age=2,
+        spatial_prior_birth_commit_hits=2,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    point = np.array([250.0, 280.0], dtype=np.float32)
+    det = np.array([[220, 120, 280, 280, 0.95, 0]], dtype=np.float32)
+
+    tracker.update(np.empty((0, 6), dtype=np.float32), img)
+    for _ in range(10):
+        tracker._spatial_prior_add_support(point)
+        tracker._spatial_prior_add_birth(point)
+    tracker._update_spatial_prior_stage()
+    tracker._refresh_spatial_region_masks()
+    birth_events_before = tracker.spatial_prior_birth_events
+
+    tracker.update(det, img)
+    tracker.update(det, img)
+    tracker.update(det, img)
+
+    assert tracker.spatial_prior_birth_events == birth_events_before
+
+
+def test_bytetrack_spatial_prior_support_waits_after_reactivation():
+    tracker = ByteTrack(
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        spatial_prior_enabled=True,
+        spatial_prior_decay=1.0,
+        spatial_prior_support_min_age=1,
+        spatial_prior_recovery_cooldown=3,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+
+    tracker.update(np.empty((0, 6), dtype=np.float32), img)
+    track = STrack(np.array([220, 120, 280, 280, 0.95, 0, 0], dtype=np.float32), max_obs=tracker.max_obs)
+    track.activate(tracker.kalman_filter, frame_id=1)
+    track.last_recovery_frame = tracker.frame_count
+    tracker.active_tracks = [track]
+
+    tracker._update_spatial_prior_tracks()
+    assert tracker.spatial_prior.stats().support_total == 0.0
+
+    tracker.frame_count += 3
+    tracker._update_spatial_prior_tracks()
+    assert tracker.spatial_prior.stats().support_total > 0.0
+
+
 def test_bytetrack_spatial_prior_stage_uses_entry_thresholds_only():
     tracker = ByteTrack(
         adaptive_zone_enabled=False,
@@ -1045,3 +1327,48 @@ def test_bytetrack_spatial_regions_fallback_to_rectangle_before_entry_stage():
     tracker.update(center_det, img)
     assert len(tracker.active_tracks) == 0
     assert tracker._spatial_region_ready() is False
+
+
+@pytest.mark.parametrize("method_name", ["re_activate", "update"])
+def test_bytetrack_track_recovery_clears_lost_lifecycle_state(method_name):
+    tracker = ByteTrack(adaptive_zone_enabled=False, zombie_max_history=0)
+    det1 = np.array([100, 100, 160, 220, 0.9, 0, 0], dtype=np.float32)
+    det2 = np.array([102, 102, 162, 222, 0.92, 0, 1], dtype=np.float32)
+    track = STrack(det1, max_obs=tracker.max_obs)
+    track.activate(tracker.kalman_filter, frame_id=1)
+    track.lost_frame_id = 7
+    track.frozen_mean = np.ones_like(track.mean)
+    track.exit_pending = True
+
+    new_track = STrack(det2, max_obs=tracker.max_obs)
+    getattr(track, method_name)(new_track, frame_id=8)
+
+    assert track.lost_frame_id == 0
+    assert track.frozen_mean is None
+    assert bool(getattr(track, "exit_pending", False)) is False
+
+
+def test_bytetrack_frozen_state_is_rebuilt_per_lost_cycle():
+    tracker = ByteTrack(adaptive_zone_enabled=False, zombie_max_history=0)
+    det1 = np.array([100, 100, 160, 220, 0.9, 0, 0], dtype=np.float32)
+    det2 = np.array([102, 102, 162, 222, 0.92, 0, 1], dtype=np.float32)
+    track = STrack(det1, max_obs=tracker.max_obs)
+    track.activate(tracker.kalman_filter, frame_id=1)
+
+    stale_frozen = np.full_like(track.mean, 11.0)
+    track.lost_frame_id = 5
+    track.frozen_mean = stale_frozen.copy()
+    track.exit_pending = True
+
+    refreshed_track = STrack(det2, max_obs=tracker.max_obs)
+    track.re_activate(refreshed_track, frame_id=6)
+
+    track.mean[:4] = np.array([340.0, 280.0, 0.6, 150.0], dtype=np.float32)
+    track.lost_frame_id = 12
+    assert track.frozen_mean is None
+
+    if track.frozen_mean is None:
+        track.frozen_mean = track.mean.copy()
+
+    assert not np.array_equal(track.frozen_mean, stale_frozen)
+    np.testing.assert_allclose(track.frozen_mean[:4], track.mean[:4])

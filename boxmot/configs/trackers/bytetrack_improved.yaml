@@ -124,6 +124,57 @@ zombie_reid_min_box_area:
   default: 1024
   range: [0, 4097, 256]
 
+# Recent lost-track recovery before zombie/new birth
+lost_reid_enabled:
+  type: choice
+  default: true
+  options: [true, false]
+
+lost_match_max_dist:
+  type: qrandint
+  default: 120
+  range: [60, 241, 10]
+
+lost_reid_max_frames:
+  type: qrandint
+  default: 15
+  range: [3, 31, 1]
+
+lost_reid_weight:
+  type: uniform
+  default: 0.7
+  range: [0.4, 0.9]
+
+lost_motion_weight:
+  type: uniform
+  default: 0.25
+  range: [0.05, 0.4]
+
+lost_shape_weight:
+  type: uniform
+  default: 0.05
+  range: [0.0, 0.2]
+
+lost_reid_thresh:
+  type: uniform
+  default: 0.25
+  range: [0.1, 0.5]
+
+lost_match_cost_thresh:
+  type: uniform
+  default: 0.35
+  range: [0.15, 0.6]
+
+lost_shape_max_ratio:
+  type: uniform
+  default: 1.8
+  range: [1.2, 3.0]
+
+lost_reid_min_box_area:
+  type: qrandint
+  default: 1024
+  range: [0, 4097, 256]
+
 # Exit zone configuration
 exit_zone_enabled:
   type: choice
@@ -148,13 +199,18 @@ adaptive_zone_enabled:
 
 adaptive_zone_update_mode:
   type: choice
-  default: always_expand
+  default: warmup_once
   options: [always_expand, warmup_once]
 
 adaptive_zone_expand_trigger:
   type: choice
-  default: all_high
+  default: outside_high
   options: [all_high, outside_high, unmatched_high]
+
+adaptive_zone_entry_mode:
+  type: choice
+  default: outside_only
+  options: [outside_only, margin_inside]
 
 adaptive_zone_warmup:
   type: qrandint
@@ -216,6 +272,16 @@ spatial_prior_support_min_age:
   type: qrandint
   default: 2
   range: [1, 11, 1]
+
+spatial_prior_entry_mode:
+  type: choice
+  default: bias_only
+  options: [bias_only, strict_region]
+
+spatial_prior_recovery_cooldown:
+  type: qrandint
+  default: 5
+  range: [0, 21, 1]
 
 spatial_prior_region_enabled:
   type: choice
