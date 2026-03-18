@@ -61,7 +61,7 @@ python -m boxmot.engine.cli --help
 - `osnet_x0_25_msmt17.pt` is present in the repo root:
 
   ```bash
-  /root/autodl-tmp/boxmot/boxmot_demo2/osnet_x0_25_msmt17.pt
+  /root/autodl-tmp/boxmot_demo2/osnet_x0_25_msmt17.pt
   ```
 
 - Test-time ReID weights are currently standardized on `osnet_x0_25_msmt17.pt`.
@@ -71,29 +71,66 @@ python -m boxmot.engine.cli --help
 - The local SOMPT22 dataset used for evaluation is under:
 
   ```bash
-  /root/autodl-tmp/boxmot/boxmot_demo2/train
+  /root/autodl-tmp/boxmot_demo2/train
   ```
 
-- Legacy cached outputs exist under the default `runs/` tree, but the old embedding cache below contains placeholder data and must **not** be used for final evaluation of the current ReID-enabled ByteTrack:
+- The local MOT20 dataset used for evaluation is under:
 
   ```bash
-  /root/autodl-tmp/boxmot/boxmot_demo2/runs/dets_n_embs/yolov8m_pretrain_crowdhuman/dets
-  /root/autodl-tmp/boxmot/boxmot_demo2/runs/dets_n_embs/yolov8m_pretrain_crowdhuman/embs/osnet_x0_25_msmt17
+  /root/autodl-tmp/boxmot_demo2/MOT20_train/train
   ```
 
-- The latest full fresh rerun that regenerated both detections and embeddings is under:
+- The historical default cache pattern under `runs/` is not present in the current workspace. If an old cache tree matching the paths below reappears, treat it as stale placeholder data and do **not** use it for current ReID-enabled ByteTrack evaluation:
 
   ```bash
-  /root/autodl-tmp/boxmot/boxmot_demo2/runs_fullrerun_20260315_094907
+  runs/dets_n_embs/yolov8m_pretrain_crowdhuman/dets
+  runs/dets_n_embs/yolov8m_pretrain_crowdhuman/embs/osnet_x0_25_msmt17
   ```
 
-- Freshly generated detector outputs, embeddings, and MOT results for that run are:
+- The canonical reusable SOMPT22 **person-only** det/emb cache for cross-tracker comparisons is under:
 
   ```bash
-  /root/autodl-tmp/boxmot/boxmot_demo2/runs_fullrerun_20260315_094907/dets_n_embs/yolov8m_pretrain_crowdhuman/dets
-  /root/autodl-tmp/boxmot/boxmot_demo2/runs_fullrerun_20260315_094907/dets_n_embs/yolov8m_pretrain_crowdhuman/embs/osnet_x0_25_msmt17
-  /root/autodl-tmp/boxmot/boxmot_demo2/runs_fullrerun_20260315_094907/mot/yolov8m_pretrain_crowdhuman_osnet_x0_25_msmt17_bytetrack
-  /root/autodl-tmp/boxmot/boxmot_demo2/runs_fullrerun_20260315_094907/eval.log
+  /root/autodl-tmp/boxmot_demo2/runs_sompt22_person_cache_yolov8m_pretrain_crowdhuman_osnet_x0_25_msmt17
+  ```
+
+- The shared cache resolves to these paths:
+
+  ```bash
+  /root/autodl-tmp/boxmot_demo2/runs_sompt22_person_cache_yolov8m_pretrain_crowdhuman_osnet_x0_25_msmt17/dets_n_embs/yolov8m_pretrain_crowdhuman/dets
+  /root/autodl-tmp/boxmot_demo2/runs_sompt22_person_cache_yolov8m_pretrain_crowdhuman_osnet_x0_25_msmt17/dets_n_embs/yolov8m_pretrain_crowdhuman/embs/osnet_x0_25_msmt17
+  ```
+
+- This shared cache is currently backed by:
+
+  ```bash
+  /root/autodl-tmp/boxmot_demo2/runs_botsort_sompt22_20260317_120609/dets_n_embs
+  ```
+
+  Notes:
+  - It was generated with detector `yolov8m_pretrain_crowdhuman`, ReID `osnet_x0_25_msmt17`, and `--classes 0`.
+  - The cached SOMPT22 detection files currently contain only class id `0`, i.e. `person`.
+  - Use this cache root as `--project` when comparing different trackers on the same detector/ReID/class setup.
+  - Keep the detector stem, ReID stem, and `--classes 0` unchanged; vary only `TRACKER` and optionally `--tracker-config`.
+  - Successful reuse is indicated by logs such as `Skipping SOMPT22-xx (cached complete...)` followed by `No sequences to process (all cached or no images).`
+  - If detector weights, ReID weights, or class filtering change, create a new `--project` root or remove only that root's `dets_n_embs/` subtree before rerunning.
+
+- The latest MOT20 **person-only** det/emb cache generated with detector `yolov8m_pretrain_crowdhuman`, ReID `osnet_x0_25_msmt17`, and `--classes 0` is under:
+
+  ```bash
+  /root/autodl-tmp/boxmot_demo2/runs_mot20_bytetrack_improved_20260317_132003
+  ```
+
+- The MOT20 cache resolves to these paths:
+
+  ```bash
+  /root/autodl-tmp/boxmot_demo2/runs_mot20_bytetrack_improved_20260317_132003/dets_n_embs/yolov8m_pretrain_crowdhuman/dets
+  /root/autodl-tmp/boxmot_demo2/runs_mot20_bytetrack_improved_20260317_132003/dets_n_embs/yolov8m_pretrain_crowdhuman/embs/osnet_x0_25_msmt17
+  ```
+
+- The corresponding MOT20 tracking results for the improved ByteTrack run are under:
+
+  ```bash
+  /root/autodl-tmp/boxmot_demo2/runs_mot20_bytetrack_improved_20260317_132003/mot/yolov8m_pretrain_crowdhuman_osnet_x0_25_msmt17_bytetrack
   ```
 
 - Latest verified full fresh eval summary on the local SOMPT22 split:
@@ -113,10 +150,10 @@ python -m boxmot.engine.cli --help
   - Main implementation files:
 
     ```bash
-    /root/autodl-tmp/boxmot/boxmot_demo2/boxmot/trackers/bytetrack/bytetrack.py
-    /root/autodl-tmp/boxmot/boxmot_demo2/boxmot/configs/trackers/bytetrack_improved.yaml
-    /root/autodl-tmp/boxmot/boxmot_demo2/boxmot/trackers/tracker_zoo.py
-    /root/autodl-tmp/boxmot/boxmot_demo2/boxmot/engine/evaluator.py
+    /root/autodl-tmp/boxmot_demo2/boxmot/trackers/bytetrack/bytetrack.py
+    /root/autodl-tmp/boxmot_demo2/boxmot/configs/trackers/bytetrack_improved.yaml
+    /root/autodl-tmp/boxmot_demo2/boxmot/trackers/tracker_zoo.py
+    /root/autodl-tmp/boxmot_demo2/boxmot/engine/evaluator.py
     ```
 
 ## 2. Workflow
@@ -230,24 +267,47 @@ PR / task descriptions should include:
 - To run a **fresh** SOMPT22 eval that does not reuse old placeholder embeddings, always write into a new `--project` directory or manually remove that directory's `dets_n_embs/` subtree first:
 
   ```bash
-  RUN_ROOT=/root/autodl-tmp/boxmot/boxmot_demo2/runs_fullrerun_$(date -u +%Y%m%d_%H%M%S)
+  RUN_ROOT=/root/autodl-tmp/boxmot_demo2/runs_fullrerun_$(date -u +%Y%m%d_%H%M%S)
 
   uv run python -m boxmot.engine.cli eval \
     yolov8m_pretrain_crowdhuman \
     osnet_x0_25_msmt17 \
     bytetrack \
-    --source /root/autodl-tmp/boxmot/boxmot_demo2/train \
-    --tracker-config /root/autodl-tmp/boxmot/boxmot_demo2/boxmot/configs/trackers/bytetrack_improved.yaml \
+    --source /root/autodl-tmp/boxmot_demo2/train \
+    --tracker-config /root/autodl-tmp/boxmot_demo2/boxmot/configs/trackers/bytetrack_improved.yaml \
     --device 0 \
     --project "$RUN_ROOT" \
     --exist-ok \
     --verbose
   ```
 
-- After a fresh eval, inspect these files first:
+- To reuse the shared SOMPT22 **person-only** dets/embs when comparing trackers, keep the same detector/ReID/class filter and point `--project` to the shared cache root:
 
   ```bash
-  tail -n 80 "$RUN_ROOT/eval.log"
+  CACHE_ROOT=/root/autodl-tmp/boxmot_demo2/runs_sompt22_person_cache_yolov8m_pretrain_crowdhuman_osnet_x0_25_msmt17
+
+  uv run python -m boxmot.engine.cli eval \
+    yolov8m_pretrain_crowdhuman \
+    osnet_x0_25_msmt17 \
+    bytetrack \
+    --source /root/autodl-tmp/boxmot_demo2/train \
+    --classes 0 \
+    --tracker-config /root/autodl-tmp/boxmot_demo2/boxmot/configs/trackers/bytetrack_improved.yaml \
+    --device 0 \
+    --project "$CACHE_ROOT" \
+    --exist-ok \
+    --verbose
+  ```
+
+  Notes:
+  - Swap `bytetrack` and `--tracker-config` for the tracker under test.
+  - Reuse works only when `yolov8m_pretrain_crowdhuman`, `osnet_x0_25_msmt17`, and `--classes 0` stay the same.
+  - New tracker outputs will be written under `$CACHE_ROOT/mot/` while `dets_n_embs/` is reused unchanged.
+
+- After a fresh eval, inspect the summary output and, if you piped stdout through `tee`, the saved console log:
+
+  ```bash
+  tail -n 80 "$RUN_ROOT/console.log"
   sed -n '1,5p' "$RUN_ROOT/mot/yolov8m_pretrain_crowdhuman_osnet_x0_25_msmt17_bytetrack/person_summary.txt"
   ```
 
