@@ -43,6 +43,25 @@ def linear_assignment(cost_matrix, thresh):
     return matches, unmatched_a, unmatched_b
 
 
+def _to_xyxy_array_fast(tracks_or_boxes):
+    """Return an xyxy array while preserving the original input order."""
+    if isinstance(tracks_or_boxes, np.ndarray):
+        return tracks_or_boxes
+    if len(tracks_or_boxes) == 0:
+        return np.empty((0, 4), dtype=np.float32)
+
+    first = tracks_or_boxes[0]
+    if isinstance(first, np.ndarray):
+        return np.asarray(tracks_or_boxes)
+
+    first_xyxy = np.asarray(first.xyxy)
+    xyxy = np.empty((len(tracks_or_boxes), first_xyxy.shape[0]), dtype=first_xyxy.dtype)
+    xyxy[0] = first_xyxy
+    for idx, track in enumerate(tracks_or_boxes[1:], start=1):
+        xyxy[idx] = track.xyxy
+    return xyxy
+
+
 def iou_distance(atracks, btracks):
     """
     Compute cost based on IoU
@@ -52,14 +71,8 @@ def iou_distance(atracks, btracks):
     :rtype cost_matrix np.ndarray
     """
 
-    if (len(atracks) > 0 and isinstance(atracks[0], np.ndarray)) or (
-        len(btracks) > 0 and isinstance(btracks[0], np.ndarray)
-    ):
-        atlbrs = atracks
-        btlbrs = btracks
-    else:
-        atlbrs = [track.xyxy for track in atracks]
-        btlbrs = [track.xyxy for track in btracks]
+    atlbrs = _to_xyxy_array_fast(atracks)
+    btlbrs = _to_xyxy_array_fast(btracks)
 
     ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
     if ious.size == 0:
@@ -131,8 +144,7 @@ def fuse_score(cost_matrix, detections):
     if cost_matrix.size == 0:
         return cost_matrix
     iou_sim = 1 - cost_matrix
-    det_confs = np.array([det.conf for det in detections])
-    det_confs = np.expand_dims(det_confs, axis=0).repeat(cost_matrix.shape[0], axis=0)
-    fuse_sim = iou_sim * det_confs
+    det_confs = np.asarray([det.conf for det in detections])
+    fuse_sim = iou_sim * det_confs[None, :]
     fuse_cost = 1 - fuse_sim
     return fuse_cost

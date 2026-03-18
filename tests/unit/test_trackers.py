@@ -12,9 +12,15 @@ from boxmot import (
 from boxmot.trackers.deepocsort.deepocsort import (
     KalmanBoxTracker as DeepOCSortKalmanBoxTracker,
 )
-from boxmot.trackers.bytetrack.bytetrack import ByteTrack, STrack
+from boxmot.trackers.bytetrack.bytetrack import (
+    ByteTrack,
+    STrack,
+    remove_duplicate_stracks,
+)
 from boxmot.trackers.bytetrack.spatial_prior import SpatialPriorField
 from boxmot.trackers.ocsort.ocsort import KalmanBoxTracker as OCSortKalmanBoxTracker
+from boxmot.utils.iou import AssociationFunction
+from boxmot.utils.ops import tlwh2xyah, xywh2tlwh, xywh2xyxy, xyxy2xywh
 from boxmot.utils import WEIGHTS
 from tests.test_config import (
     ALL_TRACKERS,
@@ -601,6 +607,367 @@ def test_bytetrack_pending_birth_expires_without_consecutive_confirmation():
     assert len(tracker.active_tracks) == 0
 
 
+def _legacy_track_xyxy(track: STrack) -> np.ndarray:
+    if track.mean is None:
+        ret = track.xywh.copy()
+    else:
+        ret = track.mean[:4].copy()
+        ret[2] *= ret[3]
+    return xywh2xyxy(ret)
+
+
+def _legacy_track_tlwh(track: STrack) -> np.ndarray:
+    if track.mean is not None:
+        ret = track.mean[:4].copy()
+        ret[2] *= ret[3]
+        return xywh2tlwh(ret)
+    return track.tlwh
+
+
+def _legacy_track_footpoint(track: STrack) -> np.ndarray:
+    if track.mean is None:
+        center_x = float(track.xywh[0])
+        center_y = float(track.xywh[1])
+        height = float(track.xywh[3])
+    else:
+        center_x = float(track.mean[0])
+        center_y = float(track.mean[1])
+        height = float(track.mean[3])
+    return np.array([center_x, center_y + 0.5 * height], dtype=np.float32)
+
+
+def _legacy_track_frozen_tlwh(track: STrack) -> np.ndarray:
+    ret = track.frozen_mean[:4].copy()
+    ret[2] *= ret[3]
+    return xywh2tlwh(ret)
+
+
+def _legacy_remove_duplicate_stracks(stracksa, stracksb):
+    atlbrs = np.asarray([track.xyxy for track in stracksa]) if stracksa else np.empty((0, 4), dtype=np.float32)
+    btlbrs = np.asarray([track.xyxy for track in stracksb]) if stracksb else np.empty((0, 4), dtype=np.float32)
+    pdist = 1.0 - AssociationFunction.iou_batch(atlbrs, btlbrs)
+    pairs = np.where(pdist < 0.15)
+    dupa, dupb = [], []
+    for p, q in zip(*pairs):
+        timep = stracksa[p].frame_id - stracksa[p].start_frame
+        timeq = stracksb[q].frame_id - stracksb[q].start_frame
+        if timep > timeq:
+            dupb.append(q)
+        else:
+            dupa.append(p)
+    resa = [t for i, t in enumerate(stracksa) if i not in dupa]
+    resb = [t for i, t in enumerate(stracksb) if i not in dupb]
+    return resa, resb
+
+
+def _legacy_build_lost_match_cost(tracker, detection_tracks, lost_stracks, max_dist):
+    invalid_cost = tracker.lost_match_cost_thresh + 1.0
+    cost_matrix = np.full(
+        (len(lost_stracks), len(detection_tracks)),
+        invalid_cost,
+        dtype=np.float32,
+    )
+    if cost_matrix.size == 0 or not tracker._lost_reid_ready():
+        return cost_matrix
+
+    lost_features = tracker._stack_track_features(lost_stracks)
+    det_features = tracker._stack_track_features(detection_tracks)
+    if lost_features is None or det_features is None:
+        return cost_matrix
+
+    emb_cost = 1.0 - np.clip(lost_features @ det_features.T, -1.0, 1.0)
+    weight_sum = max(
+        tracker.lost_reid_weight + tracker.lost_motion_weight + tracker.lost_shape_weight,
+        1e-6,
+    )
+
+    for ilost, lost_track in enumerate(lost_stracks):
+        lost_tlwh = lost_track.get_tlwh_for_matching(
+            frame_id=tracker.frame_count,
+            max_predict_frames=tracker.zombie_max_predict_frames,
+        )
+        for idet, det_track in enumerate(detection_tracks):
+            det_tlwh = det_track.tlwh
+            det_area = float(det_tlwh[2] * det_tlwh[3])
+            if det_area < tracker.lost_reid_min_box_area:
+                continue
+
+            dist = tracker._calculate_center_distance(det_tlwh, lost_tlwh)
+            if dist > max_dist:
+                continue
+
+            width_ratio = max(det_tlwh[2], lost_tlwh[2]) / max(min(det_tlwh[2], lost_tlwh[2]), 1e-6)
+            height_ratio = max(det_tlwh[3], lost_tlwh[3]) / max(min(det_tlwh[3], lost_tlwh[3]), 1e-6)
+            if max(width_ratio, height_ratio) > tracker.lost_shape_max_ratio:
+                continue
+
+            reid_cost = float(emb_cost[ilost, idet])
+            if reid_cost > tracker.lost_reid_thresh:
+                continue
+
+            motion_cost = min(1.0, dist / max(max_dist, 1e-6))
+            shape_cost = tracker._calculate_shape_cost(det_tlwh, lost_tlwh)
+            total_cost = (
+                tracker.lost_reid_weight * reid_cost
+                + tracker.lost_motion_weight * motion_cost
+                + tracker.lost_shape_weight * shape_cost
+            ) / weight_sum
+            cost_matrix[ilost, idet] = total_cost
+
+    return cost_matrix
+
+
+def _legacy_build_zombie_match_cost(tracker, detection_tracks, zombie_stracks, max_dist):
+    invalid_cost = tracker.zombie_match_cost_thresh + 1.0
+    cost_matrix = np.full(
+        (len(zombie_stracks), len(detection_tracks)),
+        invalid_cost,
+        dtype=np.float32,
+    )
+    if cost_matrix.size == 0:
+        return cost_matrix
+
+    emb_cost = None
+    if tracker._zombie_reid_ready():
+        if not all(zombie.smooth_feat is not None for zombie in zombie_stracks) or not all(
+            det.curr_feat is not None for det in detection_tracks
+        ):
+            return cost_matrix
+        zombie_features = [
+            np.asarray(zombie.smooth_feat, dtype=np.float32).reshape(-1)
+            for zombie in zombie_stracks
+        ]
+        det_features = [
+            np.asarray(det.curr_feat, dtype=np.float32).reshape(-1)
+            for det in detection_tracks
+        ]
+        feature_dim = zombie_features[0].shape[0]
+        if feature_dim == 0 or any(feat.shape[0] != feature_dim for feat in zombie_features + det_features):
+            return cost_matrix
+        zombie_features = np.vstack(zombie_features)
+        det_features = np.vstack(det_features)
+        emb_cost = 1.0 - np.clip(zombie_features @ det_features.T, -1.0, 1.0)
+
+    weight_sum = max(
+        tracker.zombie_reid_weight + tracker.zombie_motion_weight + tracker.zombie_shape_weight,
+        1e-6,
+    )
+
+    for iz, zombie in enumerate(zombie_stracks):
+        zombie_tlwh = zombie.get_tlwh_for_matching(
+            frame_id=tracker.frame_count,
+            max_predict_frames=tracker.zombie_max_predict_frames,
+        )
+        for idet, det_track in enumerate(detection_tracks):
+            det_tlwh = det_track.tlwh
+            det_area = float(det_tlwh[2] * det_tlwh[3])
+            if tracker._zombie_reid_ready() and det_area < tracker.zombie_reid_min_box_area:
+                continue
+
+            dist = tracker._calculate_center_distance(det_tlwh, zombie_tlwh)
+            if dist > max_dist:
+                continue
+
+            width_ratio = max(det_tlwh[2], zombie_tlwh[2]) / max(min(det_tlwh[2], zombie_tlwh[2]), 1e-6)
+            height_ratio = max(det_tlwh[3], zombie_tlwh[3]) / max(min(det_tlwh[3], zombie_tlwh[3]), 1e-6)
+            if max(width_ratio, height_ratio) > tracker.zombie_shape_max_ratio:
+                continue
+
+            motion_cost = min(1.0, dist / max(max_dist, 1e-6))
+            shape_cost = tracker._calculate_shape_cost(det_tlwh, zombie_tlwh)
+
+            if emb_cost is not None:
+                reid_cost = float(emb_cost[iz, idet])
+                if reid_cost > tracker.zombie_reid_thresh:
+                    continue
+                total_cost = (
+                    tracker.zombie_reid_weight * reid_cost
+                    + tracker.zombie_motion_weight * motion_cost
+                    + tracker.zombie_shape_weight * shape_cost
+                ) / weight_sum
+            else:
+                total_cost = (
+                    tracker.zombie_motion_weight * motion_cost
+                    + tracker.zombie_shape_weight * shape_cost
+                ) / max(tracker.zombie_motion_weight + tracker.zombie_shape_weight, 1e-6)
+
+            cost_matrix[iz, idet] = total_cost
+
+    return cost_matrix
+
+
+def test_strack_geometry_cache_matches_legacy_formulas():
+    tracker = ByteTrack(adaptive_zone_enabled=False, zombie_max_history=0)
+    det = np.array([100, 120, 160, 260, 0.95, 0, 0], dtype=np.float32)
+    track = STrack(det, max_obs=tracker.max_obs)
+
+    np.testing.assert_allclose(track.xyxy, _legacy_track_xyxy(track))
+    np.testing.assert_allclose(track.get_tlwh(), _legacy_track_tlwh(track))
+    np.testing.assert_allclose(track.footpoint(), _legacy_track_footpoint(track))
+
+    track.activate(tracker.kalman_filter, frame_id=1)
+    np.testing.assert_allclose(track.xyxy, _legacy_track_xyxy(track))
+    np.testing.assert_allclose(track.get_tlwh(), _legacy_track_tlwh(track))
+    np.testing.assert_allclose(track.footpoint(), _legacy_track_footpoint(track))
+
+    track.predict()
+    np.testing.assert_allclose(track.xyxy, _legacy_track_xyxy(track))
+    np.testing.assert_allclose(track.get_tlwh(), _legacy_track_tlwh(track))
+    np.testing.assert_allclose(track.footpoint(), _legacy_track_footpoint(track))
+    np.testing.assert_allclose(
+        track.get_tlwh_for_matching(frame_id=2, max_predict_frames=5),
+        _legacy_track_tlwh(track),
+    )
+
+    track.mark_lost()
+    track.lost_frame_id = 1
+    track.frozen_mean = track.mean.copy()
+    track._invalidate_frozen_cache()
+    np.testing.assert_allclose(
+        track.get_tlwh_for_matching(frame_id=10, max_predict_frames=5),
+        _legacy_track_frozen_tlwh(track),
+    )
+
+
+def test_prepare_detection_geometry_matches_ops_and_strack_constructor():
+    tracker = ByteTrack(adaptive_zone_enabled=False, zombie_max_history=0)
+    dets = np.array(
+        [
+            [100, 120, 160, 260],
+            [240, 100, 320, 280],
+            [420, 110, 500, 300],
+        ],
+        dtype=np.float32,
+    )
+
+    xywh_batch, tlwh_batch, xyah_batch = tracker._prepare_detection_geometry(dets)
+
+    np.testing.assert_allclose(xywh_batch, xyxy2xywh(dets))
+    np.testing.assert_allclose(tlwh_batch, xywh2tlwh(xywh_batch))
+    np.testing.assert_allclose(xyah_batch, tlwh2xyah(tlwh_batch))
+
+    dets_with_meta = np.hstack(
+        [
+            dets,
+            np.array(
+                [[0.95, 0, 0], [0.92, 0, 1], [0.90, 0, 2]],
+                dtype=np.float32,
+            ),
+        ]
+    )
+    tracks = [
+        STrack(
+            det,
+            max_obs=tracker.max_obs,
+            xywh=xywh,
+            tlwh=tlwh,
+            xyah=xyah,
+        )
+        for det, xywh, tlwh, xyah in zip(dets_with_meta, xywh_batch, tlwh_batch, xyah_batch)
+    ]
+
+    for track, det in zip(tracks, dets_with_meta):
+        legacy_track = STrack(det, max_obs=tracker.max_obs)
+        np.testing.assert_allclose(track.xywh, legacy_track.xywh)
+        np.testing.assert_allclose(track.tlwh, legacy_track.tlwh)
+        np.testing.assert_allclose(track.xyah, legacy_track.xyah)
+
+
+def test_remove_duplicate_stracks_fast_path_matches_legacy_logic():
+    stracksa = [
+        STrack(np.array([100, 100, 160, 240, 0.95, 0, 0], dtype=np.float32), max_obs=10),
+        STrack(np.array([320, 100, 380, 240, 0.95, 0, 1], dtype=np.float32), max_obs=10),
+    ]
+    stracksb = [
+        STrack(np.array([102, 102, 162, 242, 0.90, 0, 2], dtype=np.float32), max_obs=10),
+        STrack(np.array([420, 100, 480, 240, 0.88, 0, 3], dtype=np.float32), max_obs=10),
+    ]
+
+    for idx, track in enumerate(stracksa + stracksb, start=1):
+        track.id = idx
+    stracksa[0].start_frame, stracksa[0].frame_id = 1, 12
+    stracksa[1].start_frame, stracksa[1].frame_id = 5, 12
+    stracksb[0].start_frame, stracksb[0].frame_id = 6, 12
+    stracksb[1].start_frame, stracksb[1].frame_id = 4, 12
+
+    expected_a, expected_b = _legacy_remove_duplicate_stracks(stracksa, stracksb)
+    actual_a, actual_b = remove_duplicate_stracks(stracksa, stracksb)
+
+    assert [track.id for track in actual_a] == [track.id for track in expected_a]
+    assert [track.id for track in actual_b] == [track.id for track in expected_b]
+
+
+def test_bytetrack_birth_reference_cache_matches_legacy_birth_suppression():
+    tracker = ByteTrack(
+        entry_margin=0,
+        strict_entry_gate=False,
+        adaptive_zone_enabled=False,
+        zombie_max_history=10,
+        birth_suppress_iou=0.7,
+        birth_suppress_center_dist=40,
+    )
+    tracker.frame_count = 10
+
+    active = STrack(
+        np.array([100, 100, 160, 240, 0.95, 0, 0], dtype=np.float32),
+        max_obs=tracker.max_obs,
+    )
+    lost = STrack(
+        np.array([260, 110, 320, 250, 0.92, 0, 1], dtype=np.float32),
+        max_obs=tracker.max_obs,
+    )
+    lost.activate(tracker.kalman_filter, frame_id=1)
+    lost.mark_lost()
+    lost.lost_frame_id = 5
+    lost.frozen_mean = lost.mean.copy()
+    lost._invalidate_frozen_cache()
+    tracker.active_tracks = [active]
+    tracker.lost_stracks = [lost]
+
+    cache = tracker._build_birth_reference_cache(tracker.active_tracks, tracker.lost_stracks)
+    refs = tracker._collect_birth_reference_tracks(tracker.active_tracks, tracker.lost_stracks)
+
+    suppressed_det = STrack(
+        np.array([102, 102, 162, 242, 0.93, 0, 2], dtype=np.float32),
+        max_obs=tracker.max_obs,
+    )
+    clear_det = STrack(
+        np.array([420, 100, 480, 240, 0.91, 0, 3], dtype=np.float32),
+        max_obs=tracker.max_obs,
+    )
+
+    assert tracker._is_birth_suppressed(suppressed_det, refs) is True
+    assert tracker._is_birth_suppressed(suppressed_det, cache) is True
+    assert tracker._is_birth_suppressed(clear_det, refs) is False
+    assert tracker._is_birth_suppressed(clear_det, cache) is False
+
+
+def test_bytetrack_birth_cache_includes_in_frame_activations():
+    tracker = ByteTrack(
+        entry_margin=0,
+        strict_entry_gate=False,
+        adaptive_zone_enabled=False,
+        zombie_max_history=0,
+        birth_confirm_frames=1,
+        birth_suppress_iou=0.7,
+        birth_suppress_center_dist=0,
+    )
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    dup_dets = np.array(
+        [
+            [100, 100, 160, 240, 0.95, 0],
+            [102, 102, 162, 242, 0.93, 0],
+        ],
+        dtype=np.float32,
+    )
+
+    tracker.update(np.empty((0, 6), dtype=np.float32), img)
+    out = tracker.update(dup_dets, img)
+
+    assert out.size == 0
+    assert len(tracker.active_tracks) == 1
+
+
 @pytest.mark.parametrize(
     ("strict_entry_gate", "expected_route"),
     [
@@ -824,6 +1191,152 @@ def test_bytetrack_recent_lost_reid_blocks_wrong_appearance():
     assert len(tracker.active_tracks) == 0
     assert len(tracker.lost_stracks) == 1
     assert len(tracker.zombie_stracks) == 0
+
+
+def test_bytetrack_recent_lost_cost_matrix_matches_legacy_loop():
+    tracker = _make_reid_ready_bytetrack(
+        adaptive_zone_enabled=False,
+        zombie_max_history=10,
+        zombie_max_predict_frames=3,
+        lost_reid_enabled=True,
+        lost_reid_weight=0.7,
+        lost_motion_weight=0.25,
+        lost_shape_weight=0.05,
+        lost_reid_thresh=0.35,
+        lost_shape_max_ratio=1.8,
+        lost_reid_min_box_area=1024.0,
+        lost_match_cost_thresh=0.4,
+        lost_match_max_dist=120.0,
+    )
+    tracker.frame_count = 20
+
+    detection_tracks = [
+        STrack(
+            np.array([100, 100, 160, 240, 0.95, 0, 0], dtype=np.float32),
+            max_obs=tracker.max_obs,
+            feat=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        ),
+        STrack(
+            np.array([238, 102, 298, 242, 0.93, 0, 1], dtype=np.float32),
+            max_obs=tracker.max_obs,
+            feat=np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        ),
+        STrack(
+            np.array([402, 120, 426, 150, 0.90, 0, 2], dtype=np.float32),
+            max_obs=tracker.max_obs,
+            feat=np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32),
+        ),
+    ]
+
+    lost_live = STrack(
+        np.array([102, 98, 162, 238, 0.94, 0, 3], dtype=np.float32),
+        max_obs=tracker.max_obs,
+        feat=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    )
+    lost_live.activate(tracker.kalman_filter, frame_id=1)
+    lost_live.mark_lost()
+    lost_live.lost_frame_id = 19
+
+    lost_frozen = STrack(
+        np.array([240, 100, 300, 240, 0.94, 0, 4], dtype=np.float32),
+        max_obs=tracker.max_obs,
+        feat=np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+    )
+    lost_frozen.activate(tracker.kalman_filter, frame_id=1)
+    lost_frozen.mark_lost()
+    lost_frozen.lost_frame_id = 10
+    lost_frozen.frozen_mean = lost_frozen.mean.copy()
+    lost_frozen._invalidate_frozen_cache()
+
+    lost_stracks = [lost_live, lost_frozen]
+
+    expected = _legacy_build_lost_match_cost(
+        tracker,
+        detection_tracks,
+        lost_stracks,
+        max_dist=tracker.lost_match_max_dist,
+    )
+    actual = tracker._build_lost_match_cost(
+        detection_tracks,
+        lost_stracks,
+        max_dist=tracker.lost_match_max_dist,
+    )
+
+    assert actual.shape == expected.shape
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_bytetrack_zombie_cost_matrix_matches_legacy_loop():
+    tracker = _make_reid_ready_bytetrack(
+        adaptive_zone_enabled=False,
+        zombie_max_history=10,
+        zombie_max_predict_frames=3,
+        zombie_reid_weight=0.75,
+        zombie_motion_weight=0.20,
+        zombie_shape_weight=0.05,
+        zombie_reid_thresh=0.3,
+        zombie_shape_max_ratio=2.0,
+        zombie_reid_min_box_area=1024.0,
+        zombie_match_cost_thresh=0.45,
+        zombie_match_max_dist=150.0,
+        zombie_dist_thresh=150.0,
+    )
+    tracker.frame_count = 20
+
+    detection_tracks = [
+        STrack(
+            np.array([100, 100, 160, 240, 0.95, 0, 0], dtype=np.float32),
+            max_obs=tracker.max_obs,
+            feat=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        ),
+        STrack(
+            np.array([242, 104, 302, 244, 0.93, 0, 1], dtype=np.float32),
+            max_obs=tracker.max_obs,
+            feat=np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        ),
+        STrack(
+            np.array([380, 130, 404, 158, 0.90, 0, 2], dtype=np.float32),
+            max_obs=tracker.max_obs,
+            feat=np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32),
+        ),
+    ]
+
+    zombie_live = STrack(
+        np.array([102, 98, 162, 238, 0.94, 0, 3], dtype=np.float32),
+        max_obs=tracker.max_obs,
+        feat=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+    )
+    zombie_live.activate(tracker.kalman_filter, frame_id=1)
+    zombie_live.mark_lost()
+    zombie_live.lost_frame_id = 19
+
+    zombie_frozen = STrack(
+        np.array([240, 100, 300, 240, 0.94, 0, 4], dtype=np.float32),
+        max_obs=tracker.max_obs,
+        feat=np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+    )
+    zombie_frozen.activate(tracker.kalman_filter, frame_id=1)
+    zombie_frozen.mark_lost()
+    zombie_frozen.lost_frame_id = 10
+    zombie_frozen.frozen_mean = zombie_frozen.mean.copy()
+    zombie_frozen._invalidate_frozen_cache()
+
+    zombie_stracks = [zombie_live, zombie_frozen]
+
+    expected = _legacy_build_zombie_match_cost(
+        tracker,
+        detection_tracks,
+        zombie_stracks,
+        max_dist=tracker._zombie_gate_dist(),
+    )
+    actual = tracker._build_zombie_match_cost(
+        detection_tracks,
+        zombie_stracks,
+        max_dist=tracker._zombie_gate_dist(),
+    )
+
+    assert actual.shape == expected.shape
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_bytetrack_spatial_prior_commits_stable_birth_and_support():
