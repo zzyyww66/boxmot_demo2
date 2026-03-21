@@ -1,0 +1,10 @@
+download:
+  runs_url: null
+  dataset_url: null
+
+benchmark:
+  source: "HIE20"
+  split: "train"
+  eval_classes:
+    1: pedestrian
+  distractor_classes: {}
