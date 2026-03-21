@@ -1,0 +1,14 @@
+download:
+  runs_url: null
+  dataset_url: null
+
+benchmark:
+  source: "MOT17"
+  split: "train"
+  eval_classes:
+    1: pedestrian
+  distractor_classes:
+    2: person_on_vehicle
+    7: static_person
+    8: distractor
+    12: reflection

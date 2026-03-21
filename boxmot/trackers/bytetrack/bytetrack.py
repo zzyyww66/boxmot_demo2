@@ -30,14 +30,37 @@ class UnmatchedHighDecision:
     birth_source: str = "unknown"
 
 
+@dataclass
+class BirthReferenceCache:
+    """Per-frame read-only geometry cache for duplicate-birth suppression."""
+
+    tracks: list
+    tlwh: np.ndarray
+    centers: np.ndarray
+
+
 class STrack(BaseTrack):
     shared_kalman = KalmanFilterXYAH()
 
-    def __init__(self, det, max_obs, feat=None, feat_history=50):
+    def __init__(
+        self,
+        det,
+        max_obs,
+        feat=None,
+        feat_history=50,
+        *,
+        xywh: np.ndarray | None = None,
+        tlwh: np.ndarray | None = None,
+        xyah: np.ndarray | None = None,
+    ):
         # wait activate
-        self.xywh = xyxy2xywh(det[0:4])  # (x1, y1, x2, y2) --> (xc, yc, w, h)
-        self.tlwh = xywh2tlwh(self.xywh)  # (xc, yc, w, h) --> (t, l, w, h)
-        self.xyah = tlwh2xyah(self.tlwh)
+        self.xywh = (
+            xyxy2xywh(det[0:4]) if xywh is None else np.array(xywh, copy=True)
+        )  # (x1, y1, x2, y2) --> (xc, yc, w, h)
+        self.tlwh = (
+            xywh2tlwh(self.xywh) if tlwh is None else np.array(tlwh, copy=True)
+        )  # (xc, yc, w, h) --> (t, l, w, h)
+        self.xyah = tlwh2xyah(self.tlwh) if xyah is None else np.array(xyah, copy=True)
         self.conf = det[4]
         self.cls = det[5]
         self.det_ind = det[6]
@@ -57,8 +80,60 @@ class STrack(BaseTrack):
         self.spatial_birth_trustworthy = False
         self.spatial_birth_source = "unknown"
         self.last_recovery_frame = -1
+        self._cached_xyxy = None
+        self._cached_tlwh_live = None
+        self._cached_footpoint_live = None
+        self._cached_tlwh_frozen = None
+        self._geom_cache_valid = False
+        self._frozen_cache_valid = False
         if feat is not None:
             self.update_features(feat)
+
+    def _invalidate_geom_cache(self) -> None:
+        """Mark cached live geometry as stale after state changes."""
+        self._cached_xyxy = None
+        self._cached_tlwh_live = None
+        self._cached_footpoint_live = None
+        self._geom_cache_valid = False
+
+    def _invalidate_frozen_cache(self) -> None:
+        """Mark cached frozen geometry as stale after frozen-state updates."""
+        self._cached_tlwh_frozen = None
+        self._frozen_cache_valid = False
+
+    def _refresh_live_geom_cache(self) -> None:
+        """Rebuild xyxy/tlwh/footpoint views from the current live state."""
+        if self.mean is None:
+            xywh = self.xywh.copy()
+            tlwh = self.tlwh.copy()
+            center_x = float(self.xywh[0])
+            center_y = float(self.xywh[1])
+            height = float(self.xywh[3])
+        else:
+            xywh = self.mean[:4].copy()
+            xywh[2] *= xywh[3]
+            tlwh = xywh2tlwh(xywh)
+            center_x = float(self.mean[0])
+            center_y = float(self.mean[1])
+            height = float(self.mean[3])
+        self._cached_xyxy = xywh2xyxy(xywh)
+        self._cached_tlwh_live = tlwh
+        self._cached_footpoint_live = np.array(
+            [center_x, center_y + 0.5 * height],
+            dtype=np.float32,
+        )
+        self._geom_cache_valid = True
+
+    def _refresh_frozen_tlwh_cache(self) -> None:
+        """Rebuild the cached frozen tlwh used by zombie matching."""
+        if self.frozen_mean is None:
+            self._cached_tlwh_frozen = None
+            self._frozen_cache_valid = False
+            return
+        xywh = self.frozen_mean[:4].copy()
+        xywh[2] *= xywh[3]
+        self._cached_tlwh_frozen = xywh2tlwh(xywh)
+        self._frozen_cache_valid = True
 
     def update_features(self, feat: np.ndarray) -> None:
         """Normalize and smooth appearance features for later zombie rescue."""
@@ -79,6 +154,7 @@ class STrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.predict(
             mean_state, self.covariance
         )
+        self._invalidate_geom_cache()
 
     @staticmethod
     def multi_predict(stracks):
@@ -94,6 +170,7 @@ class STrack(BaseTrack):
             for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
                 stracks[i].mean = mean
                 stracks[i].covariance = cov
+                stracks[i]._invalidate_geom_cache()
 
     def activate(self, kalman_filter, frame_id):
         """Start a new tracklet"""
@@ -101,6 +178,7 @@ class STrack(BaseTrack):
         self.id = self.next_id()
         self.mean, self.covariance = self.kalman_filter.initiate(self.xyah)
         self.clear_lost_lifecycle_state()
+        self._invalidate_geom_cache()
 
         self.tracklet_len = 0
         self.state = TrackState.Tracked
@@ -115,6 +193,7 @@ class STrack(BaseTrack):
             self.mean, self.covariance, new_track.xyah
         )
         self.clear_lost_lifecycle_state()
+        self._invalidate_geom_cache()
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)
         self.tracklet_len = 0
@@ -138,12 +217,13 @@ class STrack(BaseTrack):
         """
         self.frame_id = frame_id
         self.tracklet_len += 1
-        self.history_observations.append(self.xyxy)
+        self.history_observations.append(self.xyxy.copy())
 
         self.mean, self.covariance = self.kalman_filter.update(
             self.mean, self.covariance, new_track.xyah
         )
         self.clear_lost_lifecycle_state()
+        self._invalidate_geom_cache()
         self.state = TrackState.Tracked
         self.is_activated = True
         if new_track.curr_feat is not None:
@@ -158,39 +238,28 @@ class STrack(BaseTrack):
         self.lost_frame_id = 0
         self.frozen_mean = None
         self.exit_pending = False
+        self._invalidate_frozen_cache()
 
     def footpoint(self) -> np.ndarray:
         """Return the bottom-center point of the current track box."""
-        if self.mean is None:
-            center_x = float(self.xywh[0])
-            center_y = float(self.xywh[1])
-            height = float(self.xywh[3])
-        else:
-            center_x = float(self.mean[0])
-            center_y = float(self.mean[1])
-            height = float(self.mean[3])
-        return np.array([center_x, center_y + 0.5 * height], dtype=np.float32)
+        if not self._geom_cache_valid:
+            self._refresh_live_geom_cache()
+        return self._cached_footpoint_live
 
     @property
     def xyxy(self):
         """Convert bounding box to format `(min x, min y, max x, max y)`, i.e.,
         `(top left, bottom right)`.
         """
-        if self.mean is None:
-            ret = self.xywh.copy()  # (xc, yc, w, h)
-        else:
-            ret = self.mean[:4].copy()  # kf (xc, yc, a, h)
-            ret[2] *= ret[3]  # (xc, yc, a, h)  -->  (xc, yc, w, h)
-        ret = xywh2xyxy(ret)
-        return ret
+        if not self._geom_cache_valid:
+            self._refresh_live_geom_cache()
+        return self._cached_xyxy
 
     def get_tlwh(self) -> np.ndarray:
         """Return the current track box in tlwh format from the live KF state when available."""
-        if self.mean is not None:
-            ret = self.mean[:4].copy()
-            ret[2] *= ret[3]
-            return xywh2tlwh(ret)
-        return self.tlwh
+        if not self._geom_cache_valid:
+            self._refresh_live_geom_cache()
+        return self._cached_tlwh_live
 
     def get_tlwh_for_matching(self, frame_id: int = None, max_predict_frames: int = 5):
         """Get tlwh for matching, considering frozen state for zombie tracks.
@@ -209,10 +278,9 @@ class STrack(BaseTrack):
             frame_id is not None and
             self.lost_frame_id > 0 and
             frame_id - self.lost_frame_id >= max_predict_frames):
-            # Use frozen mean to compute tlwh
-            ret = self.frozen_mean[:4].copy()
-            ret[2] *= ret[3]  # (xc, yc, a, h) -> (xc, yc, w, h)
-            return xywh2tlwh(ret)
+            if not self._frozen_cache_valid:
+                self._refresh_frozen_tlwh_cache()
+            return self._cached_tlwh_frozen
 
         # Otherwise use current state (normal prediction)
         return self.get_tlwh()
@@ -466,14 +534,14 @@ class ByteTrack(BaseTracker):
         """Update support counts and commit stabilized birth events."""
         if not self._spatial_prior_active():
             return
-        support_points: list[np.ndarray] = []
+        support_tracks: list[STrack] = []
         birth_points: list[np.ndarray] = []
         for track in self.active_tracks:
             if not track.is_activated or track.state != TrackState.Tracked:
                 continue
             age = max(1, self.frame_count - track.start_frame + 1)
             if self._spatial_support_allowed(track, age):
-                support_points.append(track.footpoint())
+                support_tracks.append(track)
             if track.spatial_birth_committed:
                 continue
             hits = track.tracklet_len + 1
@@ -481,7 +549,8 @@ class ByteTrack(BaseTracker):
                 if track.spatial_birth_trustworthy and track.spatial_birth_point is not None:
                     birth_points.append(track.spatial_birth_point)
                 track.spatial_birth_committed = True
-        if support_points:
+        if support_tracks:
+            support_points = [track.footpoint() for track in support_tracks]
             self.spatial_prior.add_support_batch(support_points)
             self.spatial_prior_support_samples += len(support_points)
             self._spatial_region_dirty = True
@@ -842,8 +911,16 @@ class ByteTrack(BaseTracker):
         """Get xyxy bbox that encloses all given detections."""
         if not detections:
             return None
-        boxes = np.array([self._tlwh_to_xyxy(det.tlwh) for det in detections], dtype=np.float32)
-        return np.array([boxes[:, 0].min(), boxes[:, 1].min(), boxes[:, 2].max(), boxes[:, 3].max()], dtype=np.float32)
+        boxes = np.asarray([det.xyxy for det in detections])
+        return np.array(
+            [
+                boxes[:, 0].min(),
+                boxes[:, 1].min(),
+                boxes[:, 2].max(),
+                boxes[:, 3].max(),
+            ],
+            dtype=boxes.dtype,
+        )
 
     def _clip_zone_to_image(self, zone_xyxy):
         """Clip effective zone to image bounds."""
@@ -991,6 +1068,69 @@ class ByteTrack(BaseTracker):
         return np.sqrt((c1_x - c2_x) ** 2 + (c1_y - c2_y) ** 2)
 
     @staticmethod
+    def _calculate_iou_many(box_tlwh, boxes_tlwh) -> np.ndarray:
+        """Vectorized tlwh IoU that preserves the scalar implementation's formula."""
+        if len(boxes_tlwh) == 0:
+            return np.empty((0,), dtype=np.float32)
+
+        x1 = np.maximum(box_tlwh[0], boxes_tlwh[:, 0])
+        y1 = np.maximum(box_tlwh[1], boxes_tlwh[:, 1])
+        x2 = np.minimum(box_tlwh[0] + box_tlwh[2], boxes_tlwh[:, 0] + boxes_tlwh[:, 2])
+        y2 = np.minimum(box_tlwh[1] + box_tlwh[3], boxes_tlwh[:, 1] + boxes_tlwh[:, 3])
+
+        inter_area = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+        box1_area = box_tlwh[2] * box_tlwh[3]
+        box2_area = boxes_tlwh[:, 2] * boxes_tlwh[:, 3]
+        return inter_area / (box1_area + box2_area - inter_area + 1e-6)
+
+    @staticmethod
+    def _tlwh_centers_many(boxes_tlwh: np.ndarray) -> np.ndarray:
+        """Return bottom-free center points for a batch of tlwh boxes."""
+        if len(boxes_tlwh) == 0:
+            return np.empty((0, 2), dtype=np.float32)
+
+        centers = np.empty((len(boxes_tlwh), 2), dtype=boxes_tlwh.dtype)
+        centers[:, 0] = boxes_tlwh[:, 0] + boxes_tlwh[:, 2] / 2
+        centers[:, 1] = boxes_tlwh[:, 1] + boxes_tlwh[:, 3] / 2
+        return centers
+
+    @staticmethod
+    def _calculate_center_distance_many(
+        box_tlwh,
+        boxes_tlwh: np.ndarray,
+        box_center: np.ndarray | None = None,
+        centers: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Vectorized center-distance helper using cached centers when available."""
+        if len(boxes_tlwh) == 0:
+            return np.empty((0,), dtype=np.float32)
+
+        if box_center is None:
+            box_center = np.array(
+                [
+                    box_tlwh[0] + box_tlwh[2] / 2,
+                    box_tlwh[1] + box_tlwh[3] / 2,
+                ],
+                dtype=np.asarray(boxes_tlwh).dtype,
+            )
+        if centers is None:
+            centers = ByteTrack._tlwh_centers_many(boxes_tlwh)
+
+        dx = box_center[0] - centers[:, 0]
+        dy = box_center[1] - centers[:, 1]
+        return np.sqrt(dx ** 2 + dy ** 2)
+
+    @staticmethod
+    def _prepare_detection_geometry(
+        dets_xyxy: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Batch-precompute detection geometry using the exact ops.py formulas."""
+        xywh_batch = xyxy2xywh(dets_xyxy)
+        tlwh_batch = xywh2tlwh(xywh_batch)
+        xyah_batch = tlwh2xyah(tlwh_batch)
+        return xywh_batch, tlwh_batch, xyah_batch
+
+    @staticmethod
     def _calculate_shape_cost(box1_tlwh, box2_tlwh) -> float:
         """Return a bounded shape mismatch cost based on width/height ratios."""
         w1, h1 = float(box1_tlwh[2]), float(box1_tlwh[3])
@@ -1000,6 +1140,33 @@ class ByteTrack(BaseTracker):
         width_ratio = max(w1, w2) / max(min(w1, w2), 1e-6)
         height_ratio = max(h1, h2) / max(min(h1, h2), 1e-6)
         return min(1.0, 0.5 * (abs(np.log(width_ratio)) + abs(np.log(height_ratio))))
+
+    @staticmethod
+    def _calculate_shape_ratio_many(
+        box_tlwh: np.ndarray,
+        boxes_tlwh: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Vectorized width/height ratios using the scalar gate's exact formula."""
+        width_ratio = np.maximum(box_tlwh[2], boxes_tlwh[:, 2]) / np.maximum(
+            np.minimum(box_tlwh[2], boxes_tlwh[:, 2]),
+            1e-6,
+        )
+        height_ratio = np.maximum(box_tlwh[3], boxes_tlwh[:, 3]) / np.maximum(
+            np.minimum(box_tlwh[3], boxes_tlwh[:, 3]),
+            1e-6,
+        )
+        return width_ratio, height_ratio
+
+    @staticmethod
+    def _calculate_shape_cost_many(
+        width_ratio: np.ndarray,
+        height_ratio: np.ndarray,
+    ) -> np.ndarray:
+        """Vectorized shape cost using the scalar implementation's exact formula."""
+        return np.minimum(
+            1.0,
+            0.5 * (np.abs(np.log(width_ratio)) + np.abs(np.log(height_ratio))),
+        )
 
     def _zombie_gate_dist(self, max_dist=None) -> float:
         """Resolve the effective spatial gate used before zombie ReID matching."""
@@ -1083,46 +1250,69 @@ class ByteTrack(BaseTracker):
             self.zombie_reid_weight + self.zombie_motion_weight + self.zombie_shape_weight,
             1e-6,
         )
+        det_tlwh = np.asarray([det_track.tlwh for det_track in detection_tracks], dtype=np.float64)
+        det_area = det_tlwh[:, 2] * det_tlwh[:, 3]
+        det_centers = self._tlwh_centers_many(det_tlwh)
+        denom_max_dist = max(max_dist, 1e-6)
+        no_reid_weight_sum = max(
+            self.zombie_motion_weight + self.zombie_shape_weight,
+            1e-6,
+        )
 
         for iz, zombie in enumerate(zombie_stracks):
-            zombie_tlwh = zombie.get_tlwh_for_matching(
-                frame_id=self.frame_count,
-                max_predict_frames=self.zombie_max_predict_frames,
+            zombie_tlwh = np.asarray(
+                zombie.get_tlwh_for_matching(
+                    frame_id=self.frame_count,
+                    max_predict_frames=self.zombie_max_predict_frames,
+                ),
+                dtype=np.float64,
             )
-            for idet, det_track in enumerate(detection_tracks):
-                det_tlwh = det_track.tlwh
-                det_area = float(det_tlwh[2] * det_tlwh[3])
-                if self._zombie_reid_ready() and det_area < self.zombie_reid_min_box_area:
+            if emb_cost is not None:
+                valid = det_area >= self.zombie_reid_min_box_area
+                if not np.any(valid):
                     continue
+            else:
+                valid = np.ones(len(detection_tracks), dtype=bool)
 
-                dist = self._calculate_center_distance(det_tlwh, zombie_tlwh)
-                if dist > max_dist:
+            dist = self._calculate_center_distance_many(
+                zombie_tlwh,
+                det_tlwh,
+                centers=det_centers,
+            )
+            valid &= dist <= max_dist
+            if not np.any(valid):
+                continue
+
+            width_ratio, height_ratio = self._calculate_shape_ratio_many(zombie_tlwh, det_tlwh)
+            valid &= np.maximum(width_ratio, height_ratio) <= self.zombie_shape_max_ratio
+            if not np.any(valid):
+                continue
+
+            valid_idx = np.flatnonzero(valid)
+            motion_cost = np.minimum(1.0, dist[valid_idx] / denom_max_dist)
+            shape_cost = self._calculate_shape_cost_many(
+                width_ratio[valid_idx],
+                height_ratio[valid_idx],
+            )
+
+            if emb_cost is not None:
+                reid_row = np.asarray(emb_cost[iz], dtype=np.float64)
+                reid_valid = reid_row[valid_idx] <= self.zombie_reid_thresh
+                if not np.any(reid_valid):
                     continue
+                valid_idx = valid_idx[reid_valid]
+                total_cost = (
+                    self.zombie_reid_weight * reid_row[valid_idx]
+                    + self.zombie_motion_weight * motion_cost[reid_valid]
+                    + self.zombie_shape_weight * shape_cost[reid_valid]
+                ) / weight_sum
+            else:
+                total_cost = (
+                    self.zombie_motion_weight * motion_cost
+                    + self.zombie_shape_weight * shape_cost
+                ) / no_reid_weight_sum
 
-                width_ratio = max(det_tlwh[2], zombie_tlwh[2]) / max(min(det_tlwh[2], zombie_tlwh[2]), 1e-6)
-                height_ratio = max(det_tlwh[3], zombie_tlwh[3]) / max(min(det_tlwh[3], zombie_tlwh[3]), 1e-6)
-                if max(width_ratio, height_ratio) > self.zombie_shape_max_ratio:
-                    continue
-
-                motion_cost = min(1.0, dist / max(max_dist, 1e-6))
-                shape_cost = self._calculate_shape_cost(det_tlwh, zombie_tlwh)
-
-                if emb_cost is not None:
-                    reid_cost = float(emb_cost[iz, idet])
-                    if reid_cost > self.zombie_reid_thresh:
-                        continue
-                    total_cost = (
-                        self.zombie_reid_weight * reid_cost
-                        + self.zombie_motion_weight * motion_cost
-                        + self.zombie_shape_weight * shape_cost
-                    ) / weight_sum
-                else:
-                    total_cost = (
-                        self.zombie_motion_weight * motion_cost
-                        + self.zombie_shape_weight * shape_cost
-                    ) / max(self.zombie_motion_weight + self.zombie_shape_weight, 1e-6)
-
-                cost_matrix[iz, idet] = total_cost
+            cost_matrix[iz, valid_idx] = total_cost
 
         return cost_matrix
 
@@ -1152,39 +1342,54 @@ class ByteTrack(BaseTracker):
             self.lost_reid_weight + self.lost_motion_weight + self.lost_shape_weight,
             1e-6,
         )
+        det_tlwh = np.asarray([det_track.tlwh for det_track in detection_tracks], dtype=np.float64)
+        det_area = det_tlwh[:, 2] * det_tlwh[:, 3]
+        det_centers = self._tlwh_centers_many(det_tlwh)
+        denom_max_dist = max(max_dist, 1e-6)
 
         for ilost, lost_track in enumerate(lost_stracks):
-            lost_tlwh = lost_track.get_tlwh_for_matching(
-                frame_id=self.frame_count,
-                max_predict_frames=self.zombie_max_predict_frames,
+            lost_tlwh = np.asarray(
+                lost_track.get_tlwh_for_matching(
+                    frame_id=self.frame_count,
+                    max_predict_frames=self.zombie_max_predict_frames,
+                ),
+                dtype=np.float64,
             )
-            for idet, det_track in enumerate(detection_tracks):
-                det_tlwh = det_track.tlwh
-                det_area = float(det_tlwh[2] * det_tlwh[3])
-                if det_area < self.lost_reid_min_box_area:
-                    continue
+            valid = det_area >= self.lost_reid_min_box_area
+            if not np.any(valid):
+                continue
 
-                dist = self._calculate_center_distance(det_tlwh, lost_tlwh)
-                if dist > max_dist:
-                    continue
+            dist = self._calculate_center_distance_many(
+                lost_tlwh,
+                det_tlwh,
+                centers=det_centers,
+            )
+            valid &= dist <= max_dist
+            if not np.any(valid):
+                continue
 
-                width_ratio = max(det_tlwh[2], lost_tlwh[2]) / max(min(det_tlwh[2], lost_tlwh[2]), 1e-6)
-                height_ratio = max(det_tlwh[3], lost_tlwh[3]) / max(min(det_tlwh[3], lost_tlwh[3]), 1e-6)
-                if max(width_ratio, height_ratio) > self.lost_shape_max_ratio:
-                    continue
+            width_ratio, height_ratio = self._calculate_shape_ratio_many(lost_tlwh, det_tlwh)
+            valid &= np.maximum(width_ratio, height_ratio) <= self.lost_shape_max_ratio
+            if not np.any(valid):
+                continue
 
-                reid_cost = float(emb_cost[ilost, idet])
-                if reid_cost > self.lost_reid_thresh:
-                    continue
+            reid_row = np.asarray(emb_cost[ilost], dtype=np.float64)
+            valid &= reid_row <= self.lost_reid_thresh
+            if not np.any(valid):
+                continue
 
-                motion_cost = min(1.0, dist / max(max_dist, 1e-6))
-                shape_cost = self._calculate_shape_cost(det_tlwh, lost_tlwh)
-                total_cost = (
-                    self.lost_reid_weight * reid_cost
-                    + self.lost_motion_weight * motion_cost
-                    + self.lost_shape_weight * shape_cost
-                ) / weight_sum
-                cost_matrix[ilost, idet] = total_cost
+            valid_idx = np.flatnonzero(valid)
+            motion_cost = np.minimum(1.0, dist[valid_idx] / denom_max_dist)
+            shape_cost = self._calculate_shape_cost_many(
+                width_ratio[valid_idx],
+                height_ratio[valid_idx],
+            )
+            total_cost = (
+                self.lost_reid_weight * reid_row[valid_idx]
+                + self.lost_motion_weight * motion_cost
+                + self.lost_shape_weight * shape_cost
+            ) / weight_sum
+            cost_matrix[ilost, valid_idx] = total_cost
 
         return cost_matrix
 
@@ -1290,12 +1495,85 @@ class ByteTrack(BaseTracker):
                 refs.append(track)
         return refs
 
+    def _build_birth_reference_cache(self, *track_groups) -> BirthReferenceCache:
+        """Collect per-frame reference tracks and their geometry once for Step4 births."""
+        refs = self._collect_birth_reference_tracks(*track_groups)
+        if not refs:
+            return BirthReferenceCache(
+                tracks=[],
+                tlwh=np.empty((0, 4), dtype=np.float32),
+                centers=np.empty((0, 2), dtype=np.float32),
+            )
+
+        tlwh = np.stack(
+            [
+                track.get_tlwh_for_matching(
+                    frame_id=self.frame_count,
+                    max_predict_frames=self.zombie_max_predict_frames,
+                )
+                for track in refs
+            ]
+        )
+        centers = self._tlwh_centers_many(tlwh)
+        return BirthReferenceCache(tracks=refs, tlwh=tlwh, centers=centers)
+
+    def _append_birth_reference_track(
+        self,
+        reference_cache: BirthReferenceCache,
+        track: STrack,
+    ) -> BirthReferenceCache:
+        """Extend an existing birth-reference cache after an in-frame activation."""
+        if any(existing is track for existing in reference_cache.tracks):
+            return reference_cache
+
+        track_tlwh = track.get_tlwh_for_matching(
+            frame_id=self.frame_count,
+            max_predict_frames=self.zombie_max_predict_frames,
+        )
+        track_tlwh_batch = np.expand_dims(track_tlwh, axis=0)
+        track_centers = self._tlwh_centers_many(track_tlwh_batch)
+
+        reference_cache.tracks.append(track)
+        if reference_cache.tlwh.size == 0:
+            reference_cache.tlwh = track_tlwh_batch
+            reference_cache.centers = track_centers
+            return reference_cache
+
+        reference_cache.tlwh = np.concatenate((reference_cache.tlwh, track_tlwh_batch), axis=0)
+        reference_cache.centers = np.concatenate((reference_cache.centers, track_centers), axis=0)
+        return reference_cache
+
     def _is_birth_suppressed(self, det_track, reference_tracks) -> bool:
         """Check whether a new birth candidate is too close to existing tracks."""
         if self.birth_suppress_iou <= 0 and self.birth_suppress_center_dist <= 0:
             return False
 
         det_tlwh = det_track.tlwh
+        if isinstance(reference_tracks, BirthReferenceCache):
+            valid_indices = [
+                idx for idx, ref_track in enumerate(reference_tracks.tracks)
+                if ref_track is not det_track
+            ]
+            if not valid_indices:
+                return False
+
+            ref_tlwh = reference_tracks.tlwh[valid_indices]
+            ref_centers = reference_tracks.centers[valid_indices]
+            det_center = self._tlwh_centers_many(np.expand_dims(det_tlwh, axis=0))[0]
+            if self.birth_suppress_iou > 0:
+                if np.any(self._calculate_iou_many(det_tlwh, ref_tlwh) >= self.birth_suppress_iou):
+                    return True
+            if self.birth_suppress_center_dist > 0:
+                if np.any(
+                    self._calculate_center_distance_many(
+                        det_tlwh,
+                        ref_tlwh,
+                        box_center=det_center,
+                        centers=ref_centers,
+                    ) <= self.birth_suppress_center_dist
+                ):
+                    return True
+            return False
 
         for ref_track in reference_tracks:
             if ref_track is det_track:
@@ -1495,13 +1773,43 @@ class ByteTrack(BaseTracker):
 
         if len(dets) > 0:
             """Detections"""
+            det_xywh_batch, det_tlwh_batch, det_xyah_batch = self._prepare_detection_geometry(
+                dets[:, 0:4]
+            )
             if embs_first is not None:
                 detections = [
-                    STrack(det, max_obs=self.max_obs, feat=feat)
-                    for det, feat in zip(dets, embs_first)
+                    STrack(
+                        det,
+                        max_obs=self.max_obs,
+                        feat=feat,
+                        xywh=xywh,
+                        tlwh=tlwh,
+                        xyah=xyah,
+                    )
+                    for det, feat, xywh, tlwh, xyah in zip(
+                        dets,
+                        embs_first,
+                        det_xywh_batch,
+                        det_tlwh_batch,
+                        det_xyah_batch,
+                    )
                 ]
             else:
-                detections = [STrack(det, max_obs=self.max_obs) for det in dets]
+                detections = [
+                    STrack(
+                        det,
+                        max_obs=self.max_obs,
+                        xywh=xywh,
+                        tlwh=tlwh,
+                        xyah=xyah,
+                    )
+                    for det, xywh, tlwh, xyah in zip(
+                        dets,
+                        det_xywh_batch,
+                        det_tlwh_batch,
+                        det_xyah_batch,
+                    )
+                ]
         else:
             detections = []
 
@@ -1547,8 +1855,23 @@ class ByteTrack(BaseTracker):
         # association the untrack to the low conf detections
         if len(dets_second) > 0:
             """Detections"""
+            det_second_xywh, det_second_tlwh, det_second_xyah = self._prepare_detection_geometry(
+                dets_second[:, 0:4]
+            )
             detections_second = [
-                STrack(det_second, max_obs=self.max_obs) for det_second in dets_second
+                STrack(
+                    det_second,
+                    max_obs=self.max_obs,
+                    xywh=xywh,
+                    tlwh=tlwh,
+                    xyah=xyah,
+                )
+                for det_second, xywh, tlwh, xyah in zip(
+                    dets_second,
+                    det_second_xywh,
+                    det_second_tlwh,
+                    det_second_xyah,
+                )
             ]
         else:
             detections_second = []
@@ -1634,27 +1957,32 @@ class ByteTrack(BaseTracker):
             }
             center_zone_detections = []
             recovery_decisions = []
+            birth_ref_cache = self._build_birth_reference_cache(
+                self.active_tracks,
+                self.lost_stracks,
+                self.zombie_stracks,
+                activated_starcks,
+                refind_stracks,
+                lost_stracks,
+            )
 
             for det_track in unmatched_high_detections:
                 decision = decision_by_det_ind.get(int(det_track.det_ind))
                 if decision is None:
                     continue
                 if decision.route == "birth":
-                    birth_refs = self._collect_birth_reference_tracks(
-                        self.active_tracks,
-                        self.lost_stracks,
-                        self.zombie_stracks,
-                        activated_starcks,
-                        refind_stracks,
-                        lost_stracks,
-                    )
-                    self._try_activate_new_track(
+                    activated = self._try_activate_new_track(
                         det_track,
                         activated_starcks,
-                        birth_refs,
+                        birth_ref_cache,
                         skip_confirmation=decision.skip_confirmation,
                         birth_source=decision.birth_source,
                     )
+                    if activated:
+                        birth_ref_cache = self._append_birth_reference_track(
+                            birth_ref_cache,
+                            det_track,
+                        )
                     continue
                 center_zone_detections.append(det_track)
                 recovery_decisions.append(decision)
@@ -1689,25 +2017,30 @@ class ByteTrack(BaseTracker):
             decision_by_center_idx = {
                 idx: decision for idx, decision in enumerate(recovery_decisions)
             }
+            birth_ref_cache = self._build_birth_reference_cache(
+                self.active_tracks,
+                self.lost_stracks,
+                self.zombie_stracks,
+                activated_starcks,
+                refind_stracks,
+                lost_stracks,
+            )
             for local_idx in unmatched_center_zone:
                 det_track = center_zone_detections[local_idx]
                 decision = decision_by_center_idx[local_idx]
                 if decision.route == "recover_then_block":
                     continue
-                birth_refs = self._collect_birth_reference_tracks(
-                    self.active_tracks,
-                    self.lost_stracks,
-                    self.zombie_stracks,
-                    activated_starcks,
-                    refind_stracks,
-                    lost_stracks,
-                )
-                self._try_activate_new_track(
+                activated = self._try_activate_new_track(
                     det_track,
                     activated_starcks,
-                    birth_refs,
+                    birth_ref_cache,
                     birth_source="center_birth",
                 )
+                if activated:
+                    birth_ref_cache = self._append_birth_reference_track(
+                        birth_ref_cache,
+                        det_track,
+                    )
 
         """ Step 5: Update lost tracks and transition to zombie """
         # Add newly lost tracks to self.lost_stracks
@@ -1723,6 +2056,7 @@ class ByteTrack(BaseTracker):
                     frames_lost = self.frame_count - track.lost_frame_id
                     if frames_lost >= self.zombie_max_predict_frames:
                         track.frozen_mean = track.mean.copy()
+                        track._invalidate_frozen_cache()
 
         """ Step 6: Transition old lost tracks to zombie tracks """
         # In zombie mode: move stale lost tracks into zombie pool.
@@ -1743,6 +2077,7 @@ class ByteTrack(BaseTracker):
                     # Instead, move it to zombie_stracks for potential later rescue
                     if track.frozen_mean is None:
                         track.frozen_mean = track.mean.copy()
+                        track._invalidate_frozen_cache()
                     self.zombie_stracks.append(track)
                 else:
                     new_lost_stracks.append(track)
@@ -1844,7 +2179,9 @@ def sub_stracks(tlista, tlistb):
 
 
 def remove_duplicate_stracks(stracksa, stracksb):
-    pdist = iou_distance(stracksa, stracksb)
+    stracksa_xyxy = np.asarray([track.xyxy for track in stracksa]) if stracksa else np.empty((0, 4), dtype=np.float32)
+    stracksb_xyxy = np.asarray([track.xyxy for track in stracksb]) if stracksb else np.empty((0, 4), dtype=np.float32)
+    pdist = iou_distance(stracksa_xyxy, stracksb_xyxy)
     pairs = np.where(pdist < 0.15)
     dupa, dupb = list(), list()
     for p, q in zip(*pairs):

@@ -30,6 +30,11 @@ weights/*.tflite
 # evaluation tools folder (directory or symlink)
 boxmot/engine/trackeval
 
+# local datasets and experiment output roots
+/train/
+/MOT20_train/
+/runs_*/
+
 # local MOT17-04 experiment artifacts
 MOT17-04测试/
 

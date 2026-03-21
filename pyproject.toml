@@ -22,6 +22,13 @@ name     = "nvidia"
 url      = "https://pypi.nvidia.com"
 explicit = true
 
+# Match the existing lockfile, which was generated against the Aliyun PyPI mirror.
+# Mark it as the default index so uv trusts the lockfile instead of re-resolving.
+[[tool.uv.index]]
+name    = "aliyun-pypi"
+url     = "https://mirrors.aliyun.com/pypi/simple"
+default = true
+
 ##################################
 # Pin torch/vision to *an* index #
 ##################################
